@@ -1,0 +1,40 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    environment:
+      PYTHONPATH: /app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../local_data:/app/local_data
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm --workspace apps/web run dev"
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ..:/app
+    depends_on:
+      - api
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dragent
+      POSTGRES_USER: dragent
+      POSTGRES_PASSWORD: dragent
+    ports:
+      - "5432:5432"
+    volumes:
+      - dragent_pg:/var/lib/postgresql/data
+
+volumes:
+  dragent_pg:

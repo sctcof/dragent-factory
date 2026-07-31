@@ -1,0 +1,9 @@
+.venv/
+node_modules/
+.next/
+__pycache__/
+*.pyc
+local_data/metadata.json
+local_data/objects/
+apps/web/.next/
+apps/web/node_modules/

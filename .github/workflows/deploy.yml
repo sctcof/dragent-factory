@@ -1,0 +1,152 @@
+name: GitHub Deployment
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  deployments: write
+
+jobs:
+  validate:
+    name: Validate application
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install API dependencies
+        run: pip install -r apps/api/requirements.txt
+
+      - name: Compile backend
+        run: python -m compileall apps/api packages
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install web dependencies
+        run: npm ci
+
+      - name: Build web
+        run: npm --workspace apps/web run build
+
+  deploy:
+    name: Publish GitHub deployment
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: github-container-registry
+      url: https://github.com/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}-web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image names
+        id: images
+        shell: bash
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "api=ghcr.io/${repo}-api" >> "$GITHUB_OUTPUT"
+          echo "web=ghcr.io/${repo}-web" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub deployment
+        id: deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: "github-container-registry",
+              auto_merge: false,
+              required_contexts: [],
+              description: "Publish Data-RAG-Agent API and Web images to GHCR"
+            });
+            core.setOutput("deployment_id", deployment.data.id);
+
+      - name: Mark deployment in progress
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: Number("${{ steps.deployment.outputs.deployment_id }}"),
+              state: "in_progress",
+              environment_url: "https://github.com/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}-web"
+            });
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.images.outputs.api }}:latest
+            ${{ steps.images.outputs.api }}:${{ github.sha }}
+
+      - name: Publish Web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: true
+          build-args: |
+            NEXT_PUBLIC_API_BASE=${{ vars.NEXT_PUBLIC_API_BASE || 'http://localhost:8000' }}
+          tags: |
+            ${{ steps.images.outputs.web }}:latest
+            ${{ steps.images.outputs.web }}:${{ github.sha }}
+
+      - name: Mark deployment successful
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: Number("${{ steps.deployment.outputs.deployment_id }}"),
+              state: "success",
+              environment_url: "https://github.com/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}-web",
+              description: "API and Web images published to GHCR"
+            });
+
+      - name: Mark deployment failed
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: Number("${{ steps.deployment.outputs.deployment_id }}"),
+              state: "failure",
+              environment_url: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              description: "GitHub deployment failed"
+            });
+

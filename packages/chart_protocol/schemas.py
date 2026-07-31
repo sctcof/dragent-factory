@@ -1,0 +1,20 @@
+CHART_CONFIG_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "DragentChartConfig",
+    "type": "object",
+    "required": ["id", "type", "title", "dataset"],
+    "properties": {
+        "id": {"type": "string"},
+        "type": {
+            "type": "string",
+            "enum": ["metric", "line", "bar", "scatter", "table", "graph"],
+        },
+        "title": {"type": "string"},
+        "x_field": {"type": ["string", "null"]},
+        "y_fields": {"type": "array", "items": {"type": "string"}},
+        "dataset_ref": {"type": ["string", "null"]},
+        "dataset": {"type": "array", "items": {"type": "object"}},
+        "query_binding": {"type": ["object", "null"]},
+        "insight": {"type": ["string", "null"]},
+    },
+}
