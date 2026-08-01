@@ -18,7 +18,7 @@ class AgentWorkflow:
         self.data_agent = DataAgent()
         self.planner = PlannerAgent(rag=rag, router=router)
         self.coder = CoderAgent(router=router)
-        self.analyzer = AnalyzerAgent()
+        self.analyzer = AnalyzerAgent(router=router)
         self.report_agent = ReportAgent()
         self.sandbox = sandbox
 
@@ -63,6 +63,9 @@ class AgentWorkflow:
         )
         self._emit(emit, "analysis", {"message": "Analyzer Agent 解释执行结果并生成图表协议"})
         analysis = self.analyzer.explain(strategy, execution)
+        enriched_charts = analysis.get("charts") or execution.charts
+        if enriched_charts:
+            execution.charts = enriched_charts
         return {"code": code, "execution": execution, "analysis": analysis}
 
     def rerun_code(

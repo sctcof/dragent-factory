@@ -4,13 +4,16 @@ import json
 import shutil
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from packages.shared_types.models import (
+    DEFAULT_ASSET_TAG,
     Asset,
+    AssetTag,
     AuditLog,
     CartItem,
     Dashboard,
+    Dataset,
     Datasource,
     ExecutionResult,
     ModelConfig,
@@ -32,6 +35,8 @@ COLLECTIONS = [
     "sessions",
     "messages",
     "assets",
+    "asset_tags",
+    "datasets",
     "datasources",
     "datasource_credentials",
     "tasks",
@@ -53,6 +58,19 @@ PRIMARY_KEYS = {
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+@runtime_checkable
+class Repository(Protocol):
+    def all(self, collection: str) -> List[Dict[str, Any]]: ...
+
+    def get(self, collection: str, item_id: str) -> Optional[Dict[str, Any]]: ...
+
+    def upsert(self, collection: str, item: Dict[str, Any]) -> Dict[str, Any]: ...
+
+    def delete_soft(self, collection: str, item_id: str) -> None: ...
+
+    def audit(self, action: str, target_type: str, target_id: str, detail: Dict[str, Any]) -> None: ...
 
 
 class ObjectStore:
@@ -166,8 +184,73 @@ def hydrate_message(raw: Dict[str, Any]) -> Message:
     return Message(**raw)
 
 
+def normalize_asset_tags(tags: Any) -> List[str]:
+    if not isinstance(tags, list):
+        return [DEFAULT_ASSET_TAG]
+    cleaned: List[str] = []
+    seen = set()
+    for item in tags:
+        tag = str(item or "").strip()
+        if not tag:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(tag)
+    # public 与其它一级目录互斥：已归属非 public 时不再保留 public。
+    public_prefix = f"{DEFAULT_ASSET_TAG}/"
+    has_non_public = any(
+        item != DEFAULT_ASSET_TAG and not item.startswith(public_prefix)
+        for item in cleaned
+    )
+    if has_non_public:
+        cleaned = [
+            item
+            for item in cleaned
+            if item != DEFAULT_ASSET_TAG and not item.startswith(public_prefix)
+        ]
+    return cleaned or [DEFAULT_ASSET_TAG]
+
+
 def hydrate_asset(raw: Dict[str, Any]) -> Asset:
-    return Asset(**raw)
+    payload = dict(raw)
+    payload["tags"] = normalize_asset_tags(payload.get("tags"))
+    return Asset(**payload)
+
+
+def hydrate_asset_tag(raw: Dict[str, Any]) -> AssetTag:
+    payload = dict(raw)
+    name = str(payload.get("name") or "").strip() or DEFAULT_ASSET_TAG
+    path = str(payload.get("path") or "").strip() or name
+    payload["name"] = name
+    payload["path"] = path
+    payload["parent_id"] = payload.get("parent_id") or None
+    try:
+        payload["depth"] = int(payload.get("depth") or path.count("/"))
+    except (TypeError, ValueError):
+        payload["depth"] = path.count("/")
+    return AssetTag(**payload)
+
+
+def hydrate_dataset(raw: Dict[str, Any]) -> Dataset:
+    payload = dict(raw)
+    asset_ids: List[str] = []
+    seen = set()
+    for item in payload.get("asset_ids") or []:
+        asset_id = str(item or "").strip()
+        if not asset_id or asset_id in seen:
+            continue
+        seen.add(asset_id)
+        asset_ids.append(asset_id)
+    payload["asset_ids"] = asset_ids
+    tags = payload.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+    payload["tags"] = [str(item).strip() for item in tags if str(item).strip()]
+    payload["description"] = str(payload.get("description") or "")
+    payload["updated_at"] = str(payload.get("updated_at") or payload.get("created_at") or now_iso())
+    return Dataset(**payload)
 
 
 def hydrate_datasource(raw: Dict[str, Any]) -> Datasource:

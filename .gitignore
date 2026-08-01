@@ -3,7 +3,10 @@ node_modules/
 .next/
 __pycache__/
 *.pyc
+.env
 local_data/metadata.json
 local_data/objects/
+examples/ecommerce_platform/databases/
+examples/ecommerce_platform/csv/
 apps/web/.next/
 apps/web/node_modules/

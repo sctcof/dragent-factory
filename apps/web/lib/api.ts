@@ -31,6 +31,7 @@ export type Asset = {
   source_table?: string | null;
   object_key?: string;
   parse_status: string;
+  tags?: string[];
   created_at?: string;
   deleted_at?: string | null;
   data_dictionary?: {
@@ -91,6 +92,37 @@ export type Datasource = {
   asset_id?: string | null;
   error?: string | null;
   created_at: string;
+};
+
+export type AssetTag = {
+  id: string;
+  project_id: string;
+  name: string;
+  description?: string;
+  parent_id?: string | null;
+  path?: string;
+  depth?: number;
+  is_system?: boolean;
+  created_at: string;
+  deleted_at?: string | null;
+};
+
+export type Dataset = {
+  id: string;
+  project_id: string;
+  name: string;
+  description?: string;
+  asset_ids: string[];
+  tags?: string[];
+  created_at: string;
+  updated_at?: string;
+  deleted_at?: string | null;
+};
+
+export type DatasetDetail = {
+  dataset: Dataset;
+  assets: Asset[];
+  missing_asset_ids: string[];
 };
 
 export type StrategyAsset = {
@@ -195,16 +227,24 @@ export const api = {
   bootstrap: () => request<{ project_id: string; sessions: Session[]; assets: Asset[]; reports: { items?: Report[] } | Report[]; dashboards: Dashboard[]; datasources?: Datasource[]; model_config: Record<string, unknown> }>("/api/bootstrap"),
   listSessions: (status = "active") => request<{ items: Session[]; total: number }>(`/api/sessions?status=${encodeURIComponent(status)}&page_size=100`),
   assetLibrary: () => request<{ data_assets: Asset[]; strategy_assets: StrategyAsset[] }>("/api/asset-library"),
-  supportedDatasources: () => request<{ supported: Record<string, string> }>("/api/datasources/supported"),
+  supportedDatasources: () =>
+    request<{ supported: Record<string, string>; kinds?: string[]; labels?: Record<string, string> }>("/api/datasources/supported"),
   datasources: () => request<Datasource[]>("/api/datasources"),
+  testDatasource: (database_url: string) =>
+    request<{ ok: boolean; kind: string; table_count: number; tables: string[]; database_url_masked: string }>(
+      "/api/datasources/test",
+      { method: "POST", body: JSON.stringify({ database_url }) }
+    ),
   createDatasource: (payload: { name: string; database_url: string; table_name?: string; sample_limit?: number }) =>
     request<Datasource>("/api/datasources", { method: "POST", body: JSON.stringify(payload) }),
+  updateDatasource: (datasourceId: string, payload: { name: string; database_url?: string }) =>
+    request<Datasource>(`/api/datasources/${datasourceId}`, { method: "PUT", body: JSON.stringify(payload) }),
   datasourceTables: (datasourceId: string) =>
     request<{ datasource_id: string; tables: string[] }>(`/api/datasources/${datasourceId}/tables`),
-  createDatasourceAssets: (datasourceId: string, table_names: string[], sample_limit = 5000) =>
+  createDatasourceAssets: (datasourceId: string, table_names: string[], sample_limit = 5000, tags: string[] = ["public"]) =>
     request<{ assets: Asset[]; created: number; reused: number; failures: Array<{ table: string; error: string }> }>(
       `/api/datasources/${datasourceId}/assets`,
-      { method: "POST", body: JSON.stringify({ table_names, sample_limit }) }
+      { method: "POST", body: JSON.stringify({ table_names, sample_limit, tags }) }
     ),
   deleteDatasource: (datasourceId: string) => request<{ status: string }>(`/api/datasources/${datasourceId}`, { method: "DELETE" }),
   createSession: (title: string) => request<Session>("/api/sessions", { method: "POST", body: JSON.stringify({ title }) }),
@@ -220,6 +260,39 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ asset_ids, title })
     }),
+  generateAnalysisQuestions: (goal: string, asset_ids: string[], count = 8) =>
+    request<{
+      goal: string;
+      questions: string[];
+      source: string;
+      goal_inferred?: boolean;
+      generation?: Record<string, unknown>;
+    }>("/api/assets/analysis-questions", {
+      method: "POST",
+      body: JSON.stringify({ goal, asset_ids, count }),
+    }),
+  updateAssetTags: (assetId: string, tags: string[]) =>
+    request<Asset>(`/api/assets/${assetId}/tags`, { method: "PATCH", body: JSON.stringify({ tags }) }),
+  batchUpdateAssetTags: (asset_ids: string[], tags: string[], mode: "add" | "replace" = "add") =>
+    request<{ updated: Asset[]; updated_count: number; missing: string[]; mode: string; tags: string[] }>(
+      "/api/assets/tags/batch",
+      { method: "POST", body: JSON.stringify({ asset_ids, tags, mode }) }
+    ),
+  listTags: () => request<AssetTag[]>("/api/tags"),
+  createTag: (payload: { name: string; description?: string; parent_id?: string | null }) =>
+    request<AssetTag>("/api/tags", { method: "POST", body: JSON.stringify(payload) }),
+  updateTag: (tagId: string, payload: { name?: string; description?: string; parent_id?: string | null; move_parent?: boolean }) =>
+    request<AssetTag>(`/api/tags/${tagId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  deleteTag: (tagId: string) => request<{ status: string }>(`/api/tags/${tagId}`, { method: "DELETE" }),
+  listDatasets: () => request<Dataset[]>("/api/datasets"),
+  getDataset: (datasetId: string) => request<DatasetDetail>(`/api/datasets/${datasetId}`),
+  createDataset: (payload: { name: string; description?: string; asset_ids?: string[]; tags?: string[] }) =>
+    request<Dataset>("/api/datasets", { method: "POST", body: JSON.stringify(payload) }),
+  updateDataset: (datasetId: string, payload: { name?: string; description?: string; asset_ids?: string[]; tags?: string[] }) =>
+    request<Dataset>(`/api/datasets/${datasetId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  mutateDatasetAssets: (datasetId: string, asset_ids: string[], mode: "add" | "remove" | "replace" = "add") =>
+    request<Dataset>(`/api/datasets/${datasetId}/assets`, { method: "POST", body: JSON.stringify({ asset_ids, mode }) }),
+  deleteDataset: (datasetId: string) => request<{ status: string }>(`/api/datasets/${datasetId}`, { method: "DELETE" }),
   deleteAsset: (assetId: string) => request<{ status: string }>(`/api/assets/${assetId}`, { method: "DELETE" }),
   deleteStrategyAsset: (strategyId: string) => request<{ status: string }>(`/api/strategy-assets/${strategyId}`, { method: "DELETE" }),
   uploadAsset: (file: File) => {

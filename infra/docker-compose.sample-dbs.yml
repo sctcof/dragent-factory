@@ -1,0 +1,63 @@
+# Optional sample analytics databases for ecommerce demos.
+# Usage:
+#   docker compose -f infra/docker-compose.sample-dbs.yml up -d
+# Then:
+#   python scripts/seed_ecommerce_samples.py
+services:
+  sample-mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: dragent
+      MYSQL_DATABASE: ecommerce
+      MYSQL_USER: dragent
+      MYSQL_PASSWORD: dragent
+    ports:
+      - "${SAMPLE_MYSQL_PORT:-3307}:3306"
+    volumes:
+      - sample_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pdragent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  sample-clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_DB: ecommerce
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "${SAMPLE_CH_HTTP_PORT:-8124}:8123"
+      - "${SAMPLE_CH_NATIVE_PORT:-9004}:9000"
+    volumes:
+      - sample_clickhouse:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # Full SQL Server is memory-heavy (often needs ≥8GB free). Enable with:
+  #   docker compose -f infra/docker-compose.sample-dbs.yml --profile mssql up -d
+  sample-mssql:
+    profiles: ["mssql"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Dragent_Sample_123"
+      MSSQL_MEMORY_LIMIT_MB: "2048"
+    ports:
+      - "${SAMPLE_MSSQL_PORT:-1433}:1433"
+    volumes:
+      - sample_mssql:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Dragent_Sample_123' -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+volumes:
+  sample_mysql:
+  sample_clickhouse:
+  sample_mssql:

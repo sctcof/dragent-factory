@@ -1025,9 +1025,11 @@ dragent-factory/
 
 ### 阶段二：RAG 与图谱增强
 
-- 接入 RAGFlow。
-- 建立数据字典库、策略模板库、业务知识库。
-- 引入知识图谱，支持字段血缘与指标关系展示。
+> **本机联调形态已落地**（见仓库 `infra/docker-compose.yml`、`infra/ragflow/README.md`、`.env.example`）：PostgreSQL+pgvector、Redis、Neo4j、MinIO 与 API/Web 同栈；RAGFlow 以官方子栈接入，`VECTOR_BACKEND` / `DRAGENT_STORE` 可回退本地实现。
+
+- 接入 RAGFlow（`packages/rag_client/ragflow_client.py`，失败回退 `LocalRagClient`）。
+- 建立数据字典库、策略模板库、业务知识库（`knowledge_bases` / `chunks` 登记 + RAGFlow KB）。
+- 引入知识图谱，支持字段血缘与指标关系展示（Neo4j + 现有 graph API）。
 - 增加 Supporting IDs 与证据引用机制。
 - 增加历史会话管理（列表、检索、重命名、归档）、会话回放与报告中心。
 

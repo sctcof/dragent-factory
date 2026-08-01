@@ -73,6 +73,22 @@ class KnowledgeGraph(BaseModel):
     edges: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+DEFAULT_ASSET_TAG = "public"
+
+
+class AssetTag(BaseModel):
+    id: str
+    project_id: str
+    name: str
+    description: str = ""
+    parent_id: Optional[str] = None
+    path: str = ""
+    depth: int = 0
+    is_system: bool = False
+    created_at: str = Field(default_factory=now_iso)
+    deleted_at: Optional[str] = None
+
+
 class Asset(BaseModel):
     id: str
     project_id: str
@@ -84,9 +100,24 @@ class Asset(BaseModel):
     version: int = 1
     datasource_id: Optional[str] = None
     source_table: Optional[str] = None
+    tags: List[str] = Field(default_factory=lambda: [DEFAULT_ASSET_TAG])
     data_dictionary: Optional[DataDictionary] = None
     graph: KnowledgeGraph = Field(default_factory=KnowledgeGraph)
     created_at: str = Field(default_factory=now_iso)
+    deleted_at: Optional[str] = None
+
+
+class Dataset(BaseModel):
+    """Named reusable collection of data assets for multi-table analysis."""
+
+    id: str
+    project_id: str
+    name: str
+    description: str = ""
+    asset_ids: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=now_iso)
+    updated_at: str = Field(default_factory=now_iso)
     deleted_at: Optional[str] = None
 
 

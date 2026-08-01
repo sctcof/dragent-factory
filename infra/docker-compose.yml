@@ -1,40 +1,111 @@
+# Target local stack: postgres(pgvector) + redis + neo4j + minio + api + web.
+# RAGFlow is a separate official stack; see infra/ragflow/README.md
+# Optional profile "ragflow-docs" only prints a reminder container (does not pull RAGFlow images).
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dragent}
+      POSTGRES_USER: ${POSTGRES_USER:-dragent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dragent}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - dragent_pg:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dragent} -d ${POSTGRES_DB:-dragent}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-dragent-neo4j}
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - dragent_neo4j:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-dragent}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-dragent-secret}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - dragent_minio:/data
+
   api:
     build:
       context: ..
       dockerfile: apps/api/Dockerfile
     environment:
       PYTHONPATH: /app
+      DRAGENT_STORE: ${DRAGENT_STORE:-postgres}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://dragent:dragent@postgres:5432/dragent}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-dragent-neo4j}
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-local}
+      RAGFLOW_BASE_URL: ${RAGFLOW_BASE_URL:-}
+      RAGFLOW_API_KEY: ${RAGFLOW_API_KEY:-}
     ports:
       - "8000:8000"
     volumes:
       - ../local_data:/app/local_data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
   web:
     image: node:22-alpine
     working_dir: /app
     command: sh -c "npm install && npm --workspace apps/web run dev"
     environment:
-      NEXT_PUBLIC_API_BASE: http://localhost:8000
+      NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
     ports:
       - "3000:3000"
     volumes:
       - ..:/app
     depends_on:
       - api
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: dragent
-      POSTGRES_USER: dragent
-      POSTGRES_PASSWORD: dragent
-    ports:
-      - "5432:5432"
-    volumes:
-      - dragent_pg:/var/lib/postgresql/data
+
+  ragflow-hint:
+    profiles: ["ragflow"]
+    image: alpine:3.20
+    command: >
+      sh -c "echo 'Start official RAGFlow separately — see infra/ragflow/README.md' &&
+             echo 'Then set VECTOR_BACKEND=ragflow RAGFLOW_BASE_URL=http://host.docker.internal:9380' &&
+             sleep infinity"
 
 volumes:
   dragent_pg:
+  dragent_neo4j:
+  dragent_minio:

@@ -4,7 +4,6 @@ import json
 from typing import Any, Dict, List
 
 from packages.llm_gateway import ModelRouter
-from packages.rag_client import LocalRagClient
 from packages.shared_types.models import Asset, ChartConfig, ChartType, ExecutionResult, Strategy, StrategyTemplate
 
 
@@ -20,7 +19,7 @@ class DataAgent:
 
 
 class PlannerAgent:
-    def __init__(self, rag: LocalRagClient, router: ModelRouter) -> None:
+    def __init__(self, rag: Any, router: ModelRouter) -> None:
         self.rag = rag
         self.router = router
 
@@ -227,22 +226,47 @@ print(payload["summary"])
 
 
 class AnalyzerAgent:
+    def __init__(self, router: ModelRouter | None = None) -> None:
+        self.router = router
+
     def explain(self, strategy: Strategy, execution: ExecutionResult) -> Dict[str, Any]:
         if execution.status != "success":
             return {
-                "summary": "代码执行失败，已记录 stderr，可在代码沙箱中修改后重跑。",
+                "summary": (
+                    f"针对分析目标「{strategy.objective}」的执行失败，已记录 stderr，"
+                    "可在代码沙箱中修改后重跑。"
+                ),
+                "findings": [],
                 "charts": [],
             }
-        top_line = "分析执行成功。"
-        if execution.table:
-            top_line += f" 返回 {len(execution.table)} 行结果。"
-        if execution.charts:
-            chart = execution.charts[0]
-            if chart.insight:
-                top_line += " " + chart.insight
+
+        facts = _execution_facts(strategy, execution)
+        findings = _data_findings(strategy, execution, facts)
+        narrative = _goal_narrative(strategy, execution, facts, findings)
+        if self.router is not None:
+            llm_summary = _llm_analysis_summary(self.router, strategy, execution, facts, findings)
+            if llm_summary:
+                narrative = llm_summary.get("summary") or narrative
+                llm_findings = [
+                    str(item).strip()
+                    for item in (llm_summary.get("findings") or [])
+                    if str(item).strip()
+                ]
+                if llm_findings:
+                    findings = llm_findings[:6]
+
+        charts = _enrich_chart_insights(execution.charts, strategy, findings)
+        summary_lines = [narrative]
+        if findings:
+            summary_lines.append("")
+            summary_lines.append("关键发现：")
+            summary_lines.extend(f"- {item}" for item in findings)
+        summary_lines.append("")
+        summary_lines.append("结论仅基于本次执行结果与已解析数据字典，未覆盖未进入本次计算的字段与样本。")
         return {
-            "summary": top_line + " 结论仅基于本次执行结果与已解析数据字典。",
-            "charts": execution.charts,
+            "summary": "\n".join(summary_lines).strip(),
+            "findings": findings,
+            "charts": charts,
         }
 
 
@@ -281,6 +305,289 @@ class ReportAgent:
             ]
         )
         return "\n".join(lines)
+
+
+def _to_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _format_number(value: float) -> str:
+    if abs(value - round(value)) < 1e-9:
+        return f"{int(round(value)):,}"
+    if abs(value) >= 100:
+        return f"{value:,.1f}"
+    return f"{value:,.4g}"
+
+
+def _numeric_columns(rows: List[Dict[str, Any]], preferred: List[str] | None = None) -> List[str]:
+    if not rows:
+        return []
+    keys = list(rows[0].keys())
+    scored: List[tuple[int, str]] = []
+    for key in keys:
+        values = [_to_number(row.get(key)) for row in rows[:80]]
+        numeric_count = sum(1 for item in values if item is not None)
+        if numeric_count < max(1, len(rows[:80]) // 2):
+            continue
+        boost = 10 if preferred and key in preferred else 0
+        scored.append((numeric_count + boost, key))
+    scored.sort(reverse=True)
+    return [key for _, key in scored]
+
+
+def _category_columns(rows: List[Dict[str, Any]], preferred: List[str] | None = None) -> List[str]:
+    if not rows:
+        return []
+    numeric = set(_numeric_columns(rows))
+    keys = [key for key in rows[0].keys() if key not in numeric]
+    if preferred:
+        ordered = [key for key in preferred if key in keys]
+        ordered.extend(key for key in keys if key not in ordered)
+        return ordered
+    return keys
+
+
+def _execution_facts(strategy: Strategy, execution: ExecutionResult) -> Dict[str, Any]:
+    table = execution.table or []
+    metrics = [item for item in strategy.metrics if item and item != "row_count"]
+    dimensions = [item for item in strategy.dimensions if item]
+    numeric_cols = _numeric_columns(table, metrics)
+    category_cols = _category_columns(table, dimensions)
+    metric = next((item for item in metrics if item in numeric_cols), numeric_cols[0] if numeric_cols else None)
+    dimension = next((item for item in dimensions if item in category_cols), category_cols[0] if category_cols else None)
+
+    values = [_to_number(row.get(metric)) for row in table] if metric else []
+    values = [item for item in values if item is not None]
+    total = sum(values) if values else None
+    average = (total / len(values)) if values and total is not None else None
+    ranked: List[Dict[str, Any]] = []
+    if metric and dimension and table:
+        ranked = sorted(
+            (
+                {
+                    "label": str(row.get(dimension) if row.get(dimension) is not None else "未知"),
+                    "value": _to_number(row.get(metric)) or 0.0,
+                }
+                for row in table
+            ),
+            key=lambda item: item["value"],
+            reverse=True,
+        )
+    top = ranked[0] if ranked else None
+    bottom = ranked[-1] if len(ranked) >= 2 else None
+    contribution = None
+    if top and total:
+        contribution = top["value"] / total
+
+    quality = execution.quality_table or []
+    quality_note = None
+    if len(quality) >= 2:
+        quality_sorted = sorted(
+            quality,
+            key=lambda item: _to_number(item.get("rows")) or 0.0,
+            reverse=True,
+        )
+        largest = quality_sorted[0]
+        smallest = quality_sorted[-1]
+        quality_note = (
+            f"多数据集规模差异明显：最大 {largest.get('asset')} "
+            f"{_format_number(_to_number(largest.get('rows')) or 0)} 行，"
+            f"最小 {smallest.get('asset')} {_format_number(_to_number(smallest.get('rows')) or 0)} 行，"
+            "后续 join 需关注口径与匹配损失。"
+        )
+
+    process_highlights = [
+        str(step.get("detail") or step.get("name") or "").strip()
+        for step in (execution.process_steps or [])
+        if str(step.get("detail") or step.get("name") or "").strip()
+    ][:3]
+
+    return {
+        "row_count": len(table),
+        "metric": metric,
+        "dimension": dimension,
+        "total": total,
+        "average": average,
+        "top": top,
+        "bottom": bottom,
+        "contribution": contribution,
+        "group_count": len(ranked) if ranked else len(table),
+        "quality_note": quality_note,
+        "process_highlights": process_highlights,
+        "chart_count": len(execution.charts or []),
+    }
+
+
+def _data_findings(strategy: Strategy, execution: ExecutionResult, facts: Dict[str, Any]) -> List[str]:
+    findings: List[str] = []
+    metric = facts.get("metric")
+    dimension = facts.get("dimension")
+    top = facts.get("top")
+    bottom = facts.get("bottom")
+    total = facts.get("total")
+    average = facts.get("average")
+    contribution = facts.get("contribution")
+    row_count = int(facts.get("row_count") or 0)
+
+    if metric and total is not None:
+        findings.append(
+            f"指标 {metric} 合计 {_format_number(total)}"
+            + (f"，均值 {_format_number(average)}" if average is not None else "")
+            + f"，覆盖 {row_count} 个结果分组。"
+        )
+    elif row_count:
+        findings.append(f"本次返回 {row_count} 行可核对结果，可用于回答「{strategy.objective}」。")
+
+    if top and metric and dimension:
+        line = (
+            f"按 {dimension} 观察，{top['label']} 的 {metric} 最高"
+            f"（{_format_number(top['value'])}）"
+        )
+        if contribution is not None:
+            line += f"，约占合计 {contribution:.1%}"
+        findings.append(line + "。")
+
+    if bottom and top and metric and dimension and bottom["label"] != top["label"]:
+        gap = top["value"] - bottom["value"]
+        findings.append(
+            f"{bottom['label']} 的 {metric} 最低（{_format_number(bottom['value'])}），"
+            f"与最高项差距 {_format_number(gap)}，是优先下钻对象。"
+        )
+
+    quality_note = facts.get("quality_note")
+    if quality_note:
+        findings.append(str(quality_note))
+
+    methods = [str(item).strip() for item in (strategy.methods or []) if str(item).strip()]
+    if methods:
+        findings.append(f"本轮采用方法：{'；'.join(methods[:3])}。")
+
+    # 去重并限制数量
+    deduped: List[str] = []
+    for item in findings:
+        if item and item not in deduped:
+            deduped.append(item)
+    return deduped[:6]
+
+
+def _goal_narrative(
+    strategy: Strategy,
+    execution: ExecutionResult,
+    facts: Dict[str, Any],
+    findings: List[str],
+) -> str:
+    metric = facts.get("metric")
+    dimension = facts.get("dimension")
+    top = facts.get("top")
+    row_count = int(facts.get("row_count") or 0)
+    parts = [
+        f"针对分析目标「{strategy.objective}」，"
+        f"已按策略完成真实数据计算（返回 {row_count} 行结果"
+        + (f"，产出 {facts.get('chart_count')} 张图表" if facts.get("chart_count") else "")
+        + "）。"
+    ]
+    if metric and dimension and top:
+        parts.append(
+            f"围绕指标 {metric} 与维度 {dimension}，"
+            f"当前最突出的信号来自 {top['label']}（{_format_number(top['value'])}），"
+            "可作为下一轮归因与行动建议的切入点。"
+        )
+    elif findings:
+        parts.append(findings[0])
+    else:
+        parts.append("本次结果已可用于核对数据范围与字段口径，建议补充更明确的指标或维度后继续下钻。")
+    if strategy.dimensions or strategy.metrics:
+        parts.append(
+            "策略口径："
+            + (
+                f"维度 {('/'.join(strategy.dimensions[:3]) or '未指定')}"
+                f"，指标 {('/'.join(strategy.metrics[:3]) or '未指定')}。"
+            )
+        )
+    return "".join(parts)
+
+
+def _llm_analysis_summary(
+    router: ModelRouter,
+    strategy: Strategy,
+    execution: ExecutionResult,
+    facts: Dict[str, Any],
+    findings: List[str],
+) -> Dict[str, Any] | None:
+    sample_rows = (execution.table or [])[:12]
+    system_prompt = (
+        "你是数据分析结论助手。请根据用户分析目标与真实执行结果，生成简洁、可核对的中文结论。"
+        "要求：必须回应用户问题/目标；结论必须引用结果中的具体数值、分组或对比；"
+        "禁止编造未出现在结果中的数据；输出 JSON："
+        "{\"summary\":\"一段话\",\"findings\":[\"要点1\",\"要点2\"]}。"
+    )
+    user_prompt = (
+        f"分析目标：{strategy.objective}\n"
+        f"策略维度：{', '.join(strategy.dimensions) or '无'}\n"
+        f"策略指标：{', '.join(strategy.metrics) or '无'}\n"
+        f"策略方法：{', '.join(strategy.methods) or '无'}\n"
+        f"执行摘要事实：{json.dumps(facts, ensure_ascii=False, default=str)}\n"
+        f"启发式发现：{json.dumps(findings, ensure_ascii=False)}\n"
+        f"结果样例（最多12行）：{json.dumps(sample_rows, ensure_ascii=False, default=str)}"
+    )
+    result, _envelope = router.generate_json("analyzer", system_prompt, user_prompt)
+    if not isinstance(result, dict):
+        return None
+    summary = str(result.get("summary") or "").strip()
+    if not summary:
+        return None
+    return result
+
+
+def _enrich_chart_insights(
+    charts: List[ChartConfig],
+    strategy: Strategy,
+    findings: List[str],
+) -> List[ChartConfig]:
+    if not charts:
+        return []
+    weak_tokens = ("用于检查", "共处理", "输出", "个分组", "行记录")
+    enriched: List[ChartConfig] = []
+    finding_idx = 0
+    for chart in charts:
+        insight = (chart.insight or "").strip()
+        dataset = chart.dataset or []
+        y_fields = chart.y_fields or []
+        metric = y_fields[0] if y_fields else None
+        x_field = chart.x_field
+        data_insight = None
+        if metric and dataset:
+            ranked = sorted(
+                dataset,
+                key=lambda row: _to_number(row.get(metric)) or 0.0,
+                reverse=True,
+            )
+            if ranked:
+                top = ranked[0]
+                label = str(top.get(x_field) if x_field and top.get(x_field) is not None else chart.title)
+                value = _to_number(top.get(metric))
+                if value is not None:
+                    data_insight = (
+                        f"「{label}」在 {metric} 上最高（{_format_number(value)}），"
+                        f"与目标「{strategy.objective}」直接相关。"
+                    )
+        if (not insight or any(token in insight for token in weak_tokens)) and data_insight:
+            insight = data_insight
+        elif (not insight or any(token in insight for token in weak_tokens)) and finding_idx < len(findings):
+            insight = findings[finding_idx]
+            finding_idx += 1
+        enriched.append(chart.model_copy(update={"insight": insight or chart.insight}))
+    return enriched
 
 
 def _choose_dimensions(assets: List[Asset], intent: str) -> List[str]:

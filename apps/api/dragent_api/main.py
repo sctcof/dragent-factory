@@ -11,15 +11,17 @@ from pydantic import BaseModel, Field
 
 from packages.agent_graph import AgentWorkflow
 from packages.llm_gateway import ModelRouter
-from packages.rag_client import LocalRagClient
 from packages.sandbox_client import LocalSandboxExecutor
 from packages.shared_types.models import (
+    DEFAULT_ASSET_TAG,
     Asset,
+    AssetTag,
     AssetType,
     CartItem,
     ChartConfig,
     Dashboard,
     DashboardItem,
+    Dataset,
     Datasource,
     ExecutionResult,
     Message,
@@ -35,15 +37,27 @@ from packages.shared_types.models import (
     TaskStatus,
     now_iso,
 )
-from packages.data_connectors import SUPPORTED_HINTS, database_kind, extract_table_snapshot, list_database_tables, mask_database_url, parse_uploaded_table
+from packages.data_connectors import (
+    SUPPORTED_HINTS,
+    SUPPORTED_KINDS,
+    database_kind,
+    extract_table_snapshot,
+    list_database_tables,
+    mask_database_url,
+    parse_uploaded_table,
+    test_database_connection,
+)
 
 from .config import PROJECT_ID
-from .dependencies import objects, repo
+from .dependencies import get_cache, get_graph_store, get_rag_client, objects, repo
 from .storage import (
     hydrate_asset,
+    hydrate_asset_tag,
     hydrate_binding,
     hydrate_cart_item,
     hydrate_dashboard,
+    hydrate_dataset,
+    normalize_asset_tags,
     hydrate_datasource,
     hydrate_execution,
     hydrate_report,
@@ -157,9 +171,19 @@ class CreateDatasourceRequest(BaseModel):
     project_id: str = PROJECT_ID
 
 
+class TestDatasourceRequest(BaseModel):
+    database_url: str
+
+
+class UpdateDatasourceRequest(BaseModel):
+    name: str
+    database_url: Optional[str] = None
+
+
 class CreateDatasourceAssetsRequest(BaseModel):
     table_names: List[str]
     sample_limit: int = 5000
+    tags: List[str] = Field(default_factory=lambda: [DEFAULT_ASSET_TAG])
 
 
 class RagContextRequest(BaseModel):
@@ -171,6 +195,57 @@ class RagContextRequest(BaseModel):
 class CombinedKnowledgeGraphRequest(BaseModel):
     asset_ids: List[str]
     title: str = "多数据集整体知识图"
+
+
+class GenerateAnalysisQuestionsRequest(BaseModel):
+    goal: str
+    asset_ids: List[str]
+    count: int = 7
+
+
+class UpdateAssetTagsRequest(BaseModel):
+    tags: List[str] = Field(default_factory=lambda: [DEFAULT_ASSET_TAG])
+
+
+class BatchUpdateAssetTagsRequest(BaseModel):
+    asset_ids: List[str]
+    tags: List[str] = Field(default_factory=lambda: [DEFAULT_ASSET_TAG])
+    mode: str = "add"  # add | replace
+
+
+class CreateDatasetRequest(BaseModel):
+    name: str
+    description: str = ""
+    asset_ids: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    project_id: str = PROJECT_ID
+
+
+class UpdateDatasetRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    asset_ids: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+
+
+class DatasetAssetsRequest(BaseModel):
+    asset_ids: List[str]
+    mode: str = "add"  # add | remove | replace
+
+
+class CreateAssetTagRequest(BaseModel):
+    name: str
+    description: str = ""
+    parent_id: Optional[str] = None
+    project_id: str = PROJECT_ID
+
+
+class UpdateAssetTagRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    # None = keep current; "" / "__root__" = move to first level; id = new parent
+    parent_id: Optional[str] = None
+    move_parent: bool = False
 
 
 class TaskFeedbackRequest(BaseModel):
@@ -208,7 +283,27 @@ class StrategyFromFeedbackRequest(BaseModel):
 
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
-    return {"status": "ok", "project_id": PROJECT_ID, "time": now_iso()}
+    from .config import DRAGENT_STORE, VECTOR_BACKEND
+
+    cache = get_cache()
+    graph = get_graph_store()
+    store_ok = True
+    try:
+        repo.all("assets")
+    except Exception:
+        store_ok = False
+    return {
+        "status": "ok",
+        "project_id": PROJECT_ID,
+        "time": now_iso(),
+        "stack": {
+            "store": DRAGENT_STORE,
+            "store_ok": store_ok,
+            "vector_backend": VECTOR_BACKEND,
+            "redis": cache.ping() if hasattr(cache, "ping") else False,
+            "neo4j": graph.ping() if hasattr(graph, "ping") else False,
+        },
+    }
 
 
 @app.get("/api/bootstrap")
@@ -403,17 +498,31 @@ async def upload_asset(
         source="file",
         object_key=object_key,
         parse_status="ready",
+        tags=[DEFAULT_ASSET_TAG],
         data_dictionary=parsed["dictionary"],
         graph=parsed["graph"],
     )
+    _ensure_tags_registered(project_id, asset.tags)
     repo.upsert("assets", asset.model_dump())
+    _index_and_graph_asset(asset)
     repo.audit("asset.upload", "asset", asset.id, {"filename": file.filename, "parsed_key": parsed_key})
     return asset
 
 
 @app.get("/api/datasources/supported")
 def supported_datasources() -> Dict[str, Any]:
-    return {"supported": SUPPORTED_HINTS}
+    return {
+        "supported": SUPPORTED_HINTS,
+        "kinds": SUPPORTED_KINDS,
+        "labels": {
+            "mysql": "MySQL",
+            "postgresql": "PostgreSQL",
+            "sqlite": "SQLite",
+            "clickhouse": "ClickHouse",
+            "mssql": "SQL Server",
+            "duckdb": "DuckDB",
+        },
+    }
 
 
 @app.get("/api/datasources")
@@ -421,18 +530,27 @@ def list_datasources(project_id: str = PROJECT_ID) -> List[Datasource]:
     return [datasource for datasource in _datasources() if datasource.project_id == project_id and not datasource.deleted_at]
 
 
+@app.post("/api/datasources/test")
+def test_datasource(payload: TestDatasourceRequest) -> Dict[str, Any]:
+    try:
+        return test_database_connection(payload.database_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/datasources")
 def create_datasource(payload: CreateDatasourceRequest) -> Datasource:
     datasource_id = new_id("ds")
     try:
+        probe = test_database_connection(payload.database_url)
+        tables = list(probe.get("tables") or [])
+        # Prefer full table list for persistence.
         tables = list_database_tables(payload.database_url)
-        if not tables:
-            raise RuntimeError("数据库中没有可用的数据表")
         datasource = Datasource(
             id=datasource_id,
             project_id=payload.project_id,
             name=payload.name,
-            type=database_kind(payload.database_url),
+            type=str(probe.get("kind") or database_kind(payload.database_url)),
             database_url_masked=mask_database_url(payload.database_url),
             tables=tables,
             status="ready",
@@ -449,6 +567,56 @@ def create_datasource(payload: CreateDatasourceRequest) -> Datasource:
     except Exception as exc:
         repo.audit("datasource.create_failed", "datasource", datasource_id, {"error": str(exc)})
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/datasources/{datasource_id}")
+def get_datasource(datasource_id: str) -> Datasource:
+    return _require_datasource(datasource_id)
+
+
+@app.put("/api/datasources/{datasource_id}")
+def update_datasource(datasource_id: str, payload: UpdateDatasourceRequest) -> Datasource:
+    datasource = _require_datasource(datasource_id)
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="连接名称不能为空")
+    database_url = (payload.database_url or "").strip()
+    reuse_credential = not database_url or "***" in database_url
+    try:
+        if reuse_credential:
+            current_url = _datasource_database_url(datasource)
+            tables = list_database_tables(current_url)
+            datasource.name = name
+            datasource.tables = tables
+            datasource.status = "ready"
+            datasource.error = None
+            datasource.type = database_kind(current_url)
+            datasource.database_url_masked = mask_database_url(current_url)
+        else:
+            probe = test_database_connection(database_url)
+            tables = list_database_tables(database_url)
+            datasource.name = name
+            datasource.type = str(probe.get("kind") or database_kind(database_url))
+            datasource.database_url_masked = mask_database_url(database_url)
+            datasource.tables = tables
+            datasource.status = "ready"
+            datasource.error = None
+            repo.upsert(
+                "datasource_credentials",
+                {
+                    "id": datasource.id,
+                    "database_url": database_url,
+                    "created_at": now_iso(),
+                    "deleted_at": None,
+                },
+            )
+        repo.upsert("datasources", datasource.model_dump())
+        repo.audit("datasource.update", "datasource", datasource.id, {"table_count": len(datasource.tables)})
+        return datasource
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _datasource_database_url(datasource: Datasource) -> str:
@@ -515,10 +683,13 @@ def create_datasource_assets(datasource_id: str, payload: CreateDatasourceAssets
                 parse_status="ready",
                 datasource_id=datasource.id,
                 source_table=table_name,
+                tags=normalize_asset_tags(payload.tags),
                 data_dictionary=parsed["dictionary"],
                 graph=parsed["graph"],
             )
+            _ensure_tags_registered(datasource.project_id, asset.tags)
             repo.upsert("assets", asset.model_dump())
+            _index_and_graph_asset(asset)
             created_assets.append(asset)
         except Exception as exc:
             failures.append({"table": table_name, "error": str(exc)})
@@ -567,8 +738,8 @@ def asset_library(project_id: str = PROJECT_ID) -> Dict[str, Any]:
 @app.post("/api/assets/knowledge-graph")
 def combined_knowledge_graph(payload: CombinedKnowledgeGraphRequest) -> Dict[str, Any]:
     asset_ids = list(dict.fromkeys(payload.asset_ids))
-    if len(asset_ids) < 2:
-        raise HTTPException(status_code=400, detail="至少选择两个数据资产生成整体知识图")
+    if not asset_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个数据资产生成知识图")
     assets = [_require_asset(asset_id) for asset_id in asset_ids]
     project_ids = {asset.project_id for asset in assets}
     if len(project_ids) != 1:
@@ -584,13 +755,22 @@ def combined_knowledge_graph(payload: CombinedKnowledgeGraphRequest) -> Dict[str
     edges: List[Dict[str, Any]] = []
     field_occurrences: Dict[str, List[Dict[str, str]]] = {}
 
+    neo4j_graph = get_graph_store().load_combined_graph(asset_ids)
+    if neo4j_graph and neo4j_graph.get("nodes"):
+        nodes = neo4j_graph["nodes"]
+        if nodes and nodes[0].get("type") == "Collection":
+            nodes[0]["label"] = payload.title
+        edges = neo4j_graph.get("edges") or []
+
     for asset in assets:
-        nodes.extend(asset.graph.nodes)
-        edges.extend(asset.graph.edges)
+        if not neo4j_graph:
+            nodes.extend(asset.graph.nodes)
+            edges.extend(asset.graph.edges)
         dataset_id = f"dataset:{asset.id}"
         table_name = asset.data_dictionary.table_name if asset.data_dictionary else asset.name
         table_id = f"table:{asset.id}:{table_name}"
-        edges.append({"source": root_id, "target": dataset_id, "type": "INCLUDES"})
+        if not neo4j_graph:
+            edges.append({"source": root_id, "target": dataset_id, "type": "INCLUDES"})
         if not asset.data_dictionary:
             continue
         for column in asset.data_dictionary.columns:
@@ -680,7 +860,7 @@ def combined_knowledge_graph(payload: CombinedKnowledgeGraphRequest) -> Dict[str
     }
 
 
-def _combined_graph_questions(assets: List[Asset], inferred_joins: List[Dict[str, str]]) -> List[str]:
+def _asset_analysis_context(assets: List[Asset], inferred_joins: Optional[List[Dict[str, str]]] = None) -> Dict[str, str]:
     table_names = [
         asset.data_dictionary.table_name
         for asset in assets
@@ -718,22 +898,517 @@ def _combined_graph_questions(assets: List[Asset], inferred_joins: List[Dict[str
     tables_text = "、".join(table_names[:5])
     if len(table_names) > 5:
         tables_text += f"等 {len(table_names)} 张表"
-    join_fields = list(dict.fromkeys(join["field"] for join in inferred_joins))[:4]
+    join_fields = list(dict.fromkeys(join["field"] for join in (inferred_joins or [])))[:4]
     join_text = "、".join(join_fields) if join_fields else "潜在关联字段"
+    return {
+        "metric": metric,
+        "date_dimension": date_dimension,
+        "dimension_text": dimension_text,
+        "tables_text": tables_text or "所选数据表",
+        "join_text": join_text,
+        "secondary_dimension": dimensions[1] if len(dimensions) > 1 else "细分维度",
+        "tertiary_dimension": dimensions[2] if len(dimensions) > 2 else "补充维度",
+    }
 
+
+def _combined_graph_questions(assets: List[Asset], inferred_joins: List[Dict[str, str]]) -> List[str]:
+    ctx = _asset_analysis_context(assets, inferred_joins)
     questions = [
-        f"请联合分析 {tables_text}，统一指标口径后概览 {metric} 的整体表现，并指出最值得继续下钻的异常。",
-        f"请以 {date_dimension} 为时间轴分析 {metric} 的变化趋势，识别拐点、异常区间及其对应业务事件。",
-        f"请按 {dimension_text} 逐层下钻，对比各分组对 {metric} 的贡献、增减变化和结构差异。",
-        f"请基于 {join_text} 串联所选数据集，分析影响 {metric} 的直接因素并给出证据排序。",
+        f"请联合分析 {ctx['tables_text']}，统一指标口径后概览 {ctx['metric']} 的整体表现，并指出最值得继续下钻的异常。",
+        f"请以 {ctx['date_dimension']} 为时间轴分析 {ctx['metric']} 的变化趋势，识别拐点、异常区间及其对应业务事件。",
+        f"请按 {ctx['dimension_text']} 逐层下钻，对比各分组对 {ctx['metric']} 的贡献、增减变化和结构差异。",
+        f"请基于 {ctx['join_text']} 串联所选数据集，分析影响 {ctx['metric']} 的直接因素并给出证据排序。",
         f"请检查所选数据集之间的完整性、一致性和关联覆盖率，说明哪些数据质量问题可能影响分析结论。",
     ]
     return list(dict.fromkeys(questions))
 
 
+def _goal_progressive_questions(
+    goal: str,
+    assets: List[Asset],
+    inferred_joins: Optional[List[Dict[str, str]]] = None,
+    count: int = 7,
+) -> List[str]:
+    ctx = _asset_analysis_context(assets, inferred_joins)
+    ladder = [
+        f"围绕目标「{goal}」，先盘点 {ctx['tables_text']} 中与目标相关的核心字段、口径定义与可用样本，明确分析边界。",
+        f"基于目标「{goal}」，检查相关数据的完整性、一致性和关联覆盖率，判断当前数据是否足以支撑后续结论。",
+        f"围绕「{goal}」，统一 {ctx['metric']} 等关键指标口径，给出整体现状概览，并标出最值得继续下钻的异常。",
+        f"以 {ctx['date_dimension']} 为时间轴，分析与「{goal}」相关的趋势、拐点与阶段性变化，解释可能的业务事件。",
+        f"按 {ctx['dimension_text']} 对「{goal}」做结构拆解，比较各分组贡献、增速差异和集中度。",
+        f"进一步按 {ctx['secondary_dimension']} / {ctx['tertiary_dimension']} 下钻，定位对「{goal}」影响最大的细分群体或场景。",
+        f"基于 {ctx['join_text']} 串联多表，识别影响「{goal}」的直接驱动因素，并按证据强度排序。",
+        f"针对前序发现的关键异常，做对比诊断与归因验证，区分短期波动与结构性问题。",
+        f"综合前述层层结论，评估「{goal}」的风险点、机会点，并给出可验证的改进方向。",
+        f"面向「{goal}」输出可执行建议与监测指标，说明下一轮应优先验证的假设与所需数据。",
+    ]
+    return list(dict.fromkeys(ladder))[:count]
+
+
+@app.post("/api/assets/analysis-questions")
+def generate_analysis_questions(payload: GenerateAnalysisQuestionsRequest) -> Dict[str, Any]:
+    goal = (payload.goal or "").strip()
+    asset_ids = list(dict.fromkeys(str(item).strip() for item in payload.asset_ids if str(item).strip()))
+    if not asset_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个数据资产")
+    count = max(1, min(10, int(payload.count or 7)))
+    assets = [_require_asset(asset_id) for asset_id in asset_ids]
+    ctx = _asset_analysis_context(assets)
+    # 目标为空时，基于资产字段自动推断分析目标
+    effective_goal = goal or (
+        f"基于 {ctx['tables_text']}，围绕 {ctx['metric']} 做层层递进的业务诊断，"
+        f"并结合 {ctx['dimension_text']} 与 {ctx['date_dimension']} 定位异常与改进机会"
+    )
+    schema_lines = []
+    for asset in assets[:12]:
+        if not asset.data_dictionary:
+            continue
+        cols = ", ".join(column.name for column in asset.data_dictionary.columns[:18])
+        schema_lines.append(f"- {asset.data_dictionary.table_name}: {cols}")
+    router = ModelRouter(repo.model_config())
+    system_prompt = (
+        "你是数据分析规划助手。请根据用户目标与数据表字段，生成层层递进的分析问题。"
+        "若用户未给出明确目标，请根据数据表、指标和维度自动规划业务分析目标。"
+        "要求：问题必须从数据盘点/质量 → 整体概览 → 趋势 → 结构拆解 → 下钻归因 → 风险机会 → 行动建议逐步深入；"
+        "每题只做一层推进，后一题依赖前一题结论；输出 JSON：{\"questions\":[\"...\"]}，数量严格符合要求。"
+    )
+    user_prompt = (
+        f"分析目标：{effective_goal}\n"
+        f"是否用户显式目标：{'是' if goal else '否（请基于资产信息推断）'}\n"
+        f"问题数量：{count}\n"
+        f"可用数据表：{ctx['tables_text']}\n"
+        f"建议指标：{ctx['metric']}\n"
+        f"时间字段：{ctx['date_dimension']}\n"
+        f"维度字段：{ctx['dimension_text']}\n"
+        f"关联字段：{ctx['join_text']}\n"
+        f"字段摘要：\n" + ("\n".join(schema_lines) or "- 无详细字段")
+    )
+    llm_result, envelope = router.generate_json("planner", system_prompt, user_prompt)
+    questions: List[str] = []
+    source = "heuristic"
+    if isinstance(llm_result, dict):
+        raw_questions = llm_result.get("questions") or llm_result.get("items") or []
+        if isinstance(raw_questions, list):
+            questions = [str(item).strip() for item in raw_questions if str(item).strip()]
+            if questions:
+                source = "llm"
+    if len(questions) < count:
+        if goal:
+            questions = _goal_progressive_questions(effective_goal, assets, count=count)
+        else:
+            # 空目标：优先用资产信息递进问题，不足再补目标阶梯
+            questions = _combined_graph_questions(assets, [])
+            if len(questions) < count:
+                questions.extend(_goal_progressive_questions(effective_goal, assets, count=count))
+        source = "heuristic"
+    questions = list(dict.fromkeys(questions))[:count]
+    if len(questions) < count:
+        fallback = _goal_progressive_questions(effective_goal, assets, count=max(count, 10))
+        for item in fallback:
+            if item not in questions:
+                questions.append(item)
+            if len(questions) >= count:
+                break
+    repo.audit(
+        "assets.analysis_questions",
+        "asset_collection",
+        ",".join(asset_ids[:8]),
+        {"goal": goal or effective_goal, "count": len(questions), "source": source, "goal_inferred": not bool(goal)},
+    )
+    return {
+        "goal": goal or effective_goal,
+        "questions": questions[:count],
+        "source": source,
+        "goal_inferred": not bool(goal),
+        "generation": envelope,
+    }
+
+
 @app.get("/api/assets/{asset_id}")
 def get_asset(asset_id: str) -> Asset:
     return _require_asset(asset_id)
+
+
+@app.patch("/api/assets/{asset_id}/tags")
+def update_asset_tags(asset_id: str, payload: UpdateAssetTagsRequest) -> Asset:
+    asset = _require_asset(asset_id)
+    asset.tags = normalize_asset_tags(payload.tags)
+    _ensure_tags_registered(asset.project_id, asset.tags)
+    repo.upsert("assets", asset.model_dump())
+    repo.audit("asset.tags.update", "asset", asset.id, {"tags": asset.tags})
+    return asset
+
+
+@app.post("/api/assets/tags/batch")
+def batch_update_asset_tags(payload: BatchUpdateAssetTagsRequest) -> Dict[str, Any]:
+    asset_ids = [str(item).strip() for item in payload.asset_ids if str(item).strip()]
+    if not asset_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个数据资产")
+    mode = (payload.mode or "add").lower()
+    if mode not in {"add", "replace"}:
+        raise HTTPException(status_code=400, detail="mode 仅支持 add 或 replace")
+    selected_tags = normalize_asset_tags(payload.tags)
+    updated: List[Asset] = []
+    missing: List[str] = []
+    for asset_id in asset_ids:
+        raw = repo.get("assets", asset_id)
+        if not raw or raw.get("deleted_at"):
+            missing.append(asset_id)
+            continue
+        asset = hydrate_asset(raw)
+        if mode == "replace":
+            asset.tags = selected_tags
+        else:
+            asset.tags = normalize_asset_tags([*asset.tags, *selected_tags])
+        _ensure_tags_registered(asset.project_id, asset.tags)
+        repo.upsert("assets", asset.model_dump())
+        updated.append(asset)
+    repo.audit(
+        "asset.tags.batch_update",
+        "asset",
+        ",".join(item.id for item in updated[:20]),
+        {"count": len(updated), "mode": mode, "tags": selected_tags, "missing": missing},
+    )
+    return {
+        "updated": updated,
+        "updated_count": len(updated),
+        "missing": missing,
+        "mode": mode,
+        "tags": selected_tags,
+    }
+
+
+@app.get("/api/tags")
+def list_asset_tags(project_id: str = PROJECT_ID) -> List[AssetTag]:
+    _ensure_default_tag(project_id)
+    tags = [
+        tag
+        for tag in _asset_tags()
+        if tag.project_id == project_id and not tag.deleted_at
+    ]
+    # public root first, then stable tree order by path.
+    return sorted(
+        tags,
+        key=lambda item: (
+            0 if (item.path == DEFAULT_ASSET_TAG or item.name == DEFAULT_ASSET_TAG) else 1,
+            item.path.lower() or item.name.lower(),
+            item.depth,
+        ),
+    )
+
+
+@app.post("/api/tags")
+def create_asset_tag(payload: CreateAssetTagRequest) -> AssetTag:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="标签名称不能为空")
+    if "/" in name:
+        raise HTTPException(status_code=400, detail="标签名称不能包含 /")
+    _ensure_default_tag(payload.project_id)
+    parent: Optional[AssetTag] = None
+    raw_parent = (payload.parent_id or "").strip()
+    # Empty / __root__ => first-level tag alongside public.
+    if raw_parent and raw_parent not in {"__root__", "root", "null"}:
+        parent = _require_asset_tag(raw_parent)
+        if parent.project_id != payload.project_id or parent.deleted_at:
+            raise HTTPException(status_code=400, detail="父级标签不存在")
+    parent_id = parent.id if parent else None
+    if name.lower() == DEFAULT_ASSET_TAG:
+        raise HTTPException(status_code=400, detail="public 为系统根标签，不能重复创建")
+    sibling_conflict = next(
+        (
+            tag
+            for tag in _asset_tags()
+            if tag.project_id == payload.project_id
+            and not tag.deleted_at
+            and (tag.parent_id or None) == parent_id
+            and tag.name.lower() == name.lower()
+        ),
+        None,
+    )
+    if sibling_conflict:
+        raise HTTPException(status_code=409, detail=f"同级已存在标签：{sibling_conflict.name}")
+    path_conflict = next(
+        (
+            tag
+            for tag in _asset_tags()
+            if tag.project_id == payload.project_id
+            and not tag.deleted_at
+            and tag.path.lower() == (f"{parent.path}/{name}" if parent else name).lower()
+        ),
+        None,
+    )
+    if path_conflict:
+        raise HTTPException(status_code=409, detail=f"标签路径已存在：{path_conflict.path}")
+    path = f"{parent.path}/{name}" if parent and parent.path else name
+    tag = AssetTag(
+        id=new_id("tag"),
+        project_id=payload.project_id,
+        name=name,
+        description=payload.description.strip(),
+        parent_id=parent_id,
+        path=path,
+        depth=(parent.depth + 1) if parent else 0,
+        is_system=False,
+    )
+    repo.upsert("asset_tags", tag.model_dump())
+    repo.audit("asset_tag.create", "asset_tag", tag.id, {"name": tag.name, "path": tag.path, "parent_id": tag.parent_id})
+    return tag
+
+
+@app.patch("/api/tags/{tag_id}")
+def update_asset_tag(tag_id: str, payload: UpdateAssetTagRequest) -> AssetTag:
+    tag = _require_asset_tag(tag_id)
+    if tag.is_system or tag.path == DEFAULT_ASSET_TAG or tag.name.lower() == DEFAULT_ASSET_TAG:
+        if payload.move_parent or (payload.name and payload.name.strip() != tag.name):
+            raise HTTPException(status_code=400, detail="系统默认标签 public 不可改名或调整级别")
+        if payload.description is not None:
+            tag.description = payload.description.strip()
+            repo.upsert("asset_tags", tag.model_dump())
+        return tag
+
+    old_path = tag.path
+    new_name = tag.name
+    if payload.name is not None:
+        candidate = payload.name.strip()
+        if not candidate:
+            raise HTTPException(status_code=400, detail="标签名称不能为空")
+        if "/" in candidate:
+            raise HTTPException(status_code=400, detail="标签名称不能包含 /")
+        if candidate.lower() == DEFAULT_ASSET_TAG:
+            raise HTTPException(status_code=400, detail="不能命名为 public")
+        new_name = candidate
+
+    new_parent: Optional[AssetTag] = None
+    new_parent_id = tag.parent_id
+    if payload.move_parent:
+        raw_parent = "" if payload.parent_id is None else str(payload.parent_id).strip()
+        if raw_parent in {"", "__root__", "root", "null"}:
+            new_parent = None
+            new_parent_id = None
+        else:
+            if raw_parent == tag.id:
+                raise HTTPException(status_code=400, detail="不能将标签设置为自己的父级")
+            new_parent = _require_asset_tag(raw_parent)
+            if new_parent.project_id != tag.project_id or new_parent.deleted_at:
+                raise HTTPException(status_code=400, detail="父级标签不存在")
+            # Prevent cycles: parent cannot be current tag or its descendant.
+            if new_parent.path == tag.path or new_parent.path.startswith(f"{tag.path}/"):
+                raise HTTPException(status_code=400, detail="不能移动到自身的子标签下")
+            new_parent_id = new_parent.id
+
+    if payload.description is not None:
+        tag.description = payload.description.strip()
+
+    sibling_parent_id = new_parent_id if payload.move_parent else tag.parent_id
+    sibling_conflict = next(
+        (
+            item
+            for item in _asset_tags()
+            if item.project_id == tag.project_id
+            and not item.deleted_at
+            and item.id != tag.id
+            and (item.parent_id or None) == (sibling_parent_id or None)
+            and item.name.lower() == new_name.lower()
+        ),
+        None,
+    )
+    if sibling_conflict:
+        raise HTTPException(status_code=409, detail=f"同级已存在标签：{sibling_conflict.name}")
+
+    if payload.move_parent:
+        parent_for_path = new_parent
+        tag.parent_id = new_parent_id
+    elif tag.parent_id:
+        parent_for_path = _require_asset_tag(tag.parent_id)
+    else:
+        parent_for_path = None
+    new_path = f"{parent_for_path.path}/{new_name}" if parent_for_path and parent_for_path.path else new_name
+    new_depth = (parent_for_path.depth + 1) if parent_for_path else 0
+
+    tag.name = new_name
+    tag.path = new_path
+    tag.depth = new_depth
+    repo.upsert("asset_tags", tag.model_dump())
+
+    # Rewrite descendant paths and asset tag references.
+    path_map = {old_path: new_path}
+    descendants = [
+        item
+        for item in _asset_tags()
+        if item.project_id == tag.project_id
+        and not item.deleted_at
+        and item.id != tag.id
+        and item.path.startswith(f"{old_path}/")
+    ]
+    descendants.sort(key=lambda item: item.depth)
+    for child in descendants:
+        old_child_path = child.path
+        suffix = old_child_path[len(old_path) :]
+        child.path = f"{new_path}{suffix}"
+        child.depth = child.path.count("/")
+        repo.upsert("asset_tags", child.model_dump())
+        path_map[old_child_path] = child.path
+
+    if old_path != new_path:
+        for asset in _assets():
+            if asset.deleted_at or asset.project_id != tag.project_id:
+                continue
+            rewritten = []
+            changed = False
+            for value in normalize_asset_tags(asset.tags):
+                mapped = path_map.get(value)
+                if mapped is not None:
+                    rewritten.append(mapped)
+                    changed = True
+                elif value.startswith(f"{old_path}/"):
+                    rewritten.append(f"{new_path}{value[len(old_path):]}")
+                    changed = True
+                else:
+                    rewritten.append(value)
+            if changed:
+                asset.tags = normalize_asset_tags(rewritten)
+                repo.upsert("assets", asset.model_dump())
+
+    repo.audit(
+        "asset_tag.update",
+        "asset_tag",
+        tag.id,
+        {"old_path": old_path, "path": tag.path, "parent_id": tag.parent_id, "name": tag.name},
+    )
+    return tag
+
+
+@app.delete("/api/tags/{tag_id}")
+def delete_asset_tag(tag_id: str) -> Dict[str, Any]:
+    tag = _require_asset_tag(tag_id)
+    if tag.is_system or tag.name.lower() == DEFAULT_ASSET_TAG or tag.path == DEFAULT_ASSET_TAG:
+        raise HTTPException(status_code=400, detail="系统默认标签 public 不可删除")
+    children = [
+        child.id
+        for child in _asset_tags()
+        if not child.deleted_at and child.parent_id == tag.id
+    ]
+    if children:
+        raise HTTPException(status_code=400, detail=f"请先删除 {len(children)} 个子标签")
+    in_use = [
+        asset.id
+        for asset in _assets()
+        if not asset.deleted_at
+        and any(
+            value == tag.path or value == tag.name or value.startswith(f"{tag.path}/")
+            for value in normalize_asset_tags(asset.tags)
+        )
+    ]
+    if in_use:
+        raise HTTPException(status_code=400, detail=f"标签仍被 {len(in_use)} 个数据资产使用，请先调整资产标签")
+    repo.delete_soft("asset_tags", tag.id)
+    repo.audit("asset_tag.delete", "asset_tag", tag.id, {"name": tag.name, "path": tag.path})
+    return {"status": "deleted"}
+
+
+@app.get("/api/datasets")
+def list_datasets(project_id: str = PROJECT_ID) -> List[Dataset]:
+    items = [
+        hydrate_dataset(item)
+        for item in repo.all("datasets")
+        if not item.get("deleted_at") and item.get("project_id") == project_id
+    ]
+    items.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
+    return items
+
+
+@app.post("/api/datasets")
+def create_dataset(payload: CreateDatasetRequest) -> Dataset:
+    name = str(payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请填写数据集名称")
+    asset_ids = _normalize_dataset_asset_ids(payload.asset_ids)
+    dataset = Dataset(
+        id=new_id("dataset"),
+        project_id=payload.project_id or PROJECT_ID,
+        name=name,
+        description=str(payload.description or "").strip(),
+        asset_ids=asset_ids,
+        tags=[str(item).strip() for item in (payload.tags or []) if str(item).strip()],
+    )
+    repo.upsert("datasets", dataset.model_dump())
+    repo.audit("dataset.create", "dataset", dataset.id, {"asset_count": len(dataset.asset_ids)})
+    return dataset
+
+
+@app.get("/api/datasets/{dataset_id}")
+def get_dataset(dataset_id: str) -> Dict[str, Any]:
+    dataset = _require_dataset(dataset_id)
+    assets = []
+    missing = []
+    for asset_id in dataset.asset_ids:
+        raw = repo.get("assets", asset_id)
+        if not raw or raw.get("deleted_at"):
+            missing.append(asset_id)
+            continue
+        assets.append(hydrate_asset(raw))
+    return {"dataset": dataset, "assets": assets, "missing_asset_ids": missing}
+
+
+@app.patch("/api/datasets/{dataset_id}")
+def update_dataset(dataset_id: str, payload: UpdateDatasetRequest) -> Dataset:
+    dataset = _require_dataset(dataset_id)
+    if payload.name is not None:
+        name = str(payload.name).strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="数据集名称不能为空")
+        dataset.name = name
+    if payload.description is not None:
+        dataset.description = str(payload.description).strip()
+    if payload.asset_ids is not None:
+        dataset.asset_ids = _normalize_dataset_asset_ids(payload.asset_ids)
+    if payload.tags is not None:
+        dataset.tags = [str(item).strip() for item in payload.tags if str(item).strip()]
+    dataset.updated_at = now_iso()
+    repo.upsert("datasets", dataset.model_dump())
+    repo.audit("dataset.update", "dataset", dataset.id, {"asset_count": len(dataset.asset_ids)})
+    return dataset
+
+
+@app.post("/api/datasets/{dataset_id}/assets")
+def mutate_dataset_assets(dataset_id: str, payload: DatasetAssetsRequest) -> Dataset:
+    dataset = _require_dataset(dataset_id)
+    mode = (payload.mode or "add").lower()
+    if mode not in {"add", "remove", "replace"}:
+        raise HTTPException(status_code=400, detail="mode 仅支持 add / remove / replace")
+    incoming = _normalize_dataset_asset_ids(payload.asset_ids)
+    if mode == "replace":
+        dataset.asset_ids = incoming
+    elif mode == "remove":
+        remove_set = set(incoming)
+        dataset.asset_ids = [item for item in dataset.asset_ids if item not in remove_set]
+    else:
+        merged = list(dataset.asset_ids)
+        seen = set(merged)
+        for asset_id in incoming:
+            if asset_id in seen:
+                continue
+            seen.add(asset_id)
+            merged.append(asset_id)
+        dataset.asset_ids = merged
+    dataset.updated_at = now_iso()
+    repo.upsert("datasets", dataset.model_dump())
+    repo.audit(
+        "dataset.assets.update",
+        "dataset",
+        dataset.id,
+        {"mode": mode, "asset_count": len(dataset.asset_ids), "changed": len(incoming)},
+    )
+    return dataset
+
+
+@app.delete("/api/datasets/{dataset_id}")
+def delete_dataset(dataset_id: str) -> Dict[str, Any]:
+    _require_dataset(dataset_id)
+    repo.delete_soft("datasets", dataset_id)
+    repo.audit("dataset.delete", "dataset", dataset_id, {})
+    return {"status": "deleted"}
 
 
 @app.delete("/api/assets/{asset_id}")
@@ -780,9 +1455,9 @@ def asset_detail(asset_id: str) -> Dict[str, Any]:
             "column_count": len(columns),
         },
         "field_profiles": columns,
-        "graph": asset.graph,
+        "graph": _asset_graph_payload(asset),
         "insights": insights,
-        "relationships": asset.graph.edges,
+        "relationships": _asset_graph_payload(asset).get("edges", asset.graph.edges),
         "preview_rows": rows[:30],
     }
 
@@ -797,8 +1472,15 @@ def preview_asset(asset_id: str, limit: int = 25) -> Dict[str, Any]:
 @app.post("/api/rag/context")
 def rag_context(payload: RagContextRequest) -> Dict[str, Any]:
     assets = [_require_asset(asset_id) for asset_id in payload.asset_ids]
-    chunks = LocalRagClient().retrieve(payload.query, assets, limit=max(1, min(payload.limit, 20)))
-    return {"items": chunks}
+    limit = max(1, min(payload.limit, 20))
+    cache_key = "rag:" + "|".join(sorted(payload.asset_ids)) + f":{payload.query}:{limit}"
+    cached = get_cache().get_json(cache_key)
+    if cached is not None:
+        return {"items": cached, "cached": True}
+    chunks = get_rag_client().retrieve(payload.query, assets, limit=limit)
+    get_cache().set_json(cache_key, chunks, ttl_seconds=120)
+    get_cache().set_text("task:progress:rag", f"retrieved {len(chunks)} chunks", ttl_seconds=600)
+    return {"items": chunks, "cached": False}
 
 
 @app.get("/api/strategy-assets")
@@ -947,6 +1629,7 @@ def create_task(payload: CreateTaskRequest) -> Task:
         content=payload.message,
         task_id=task.id,
     )
+    get_cache().set_text(f"task:progress:{task.id}", "drafting_strategy", ttl_seconds=600)
     strategy = _workflow().draft_strategy(
         new_id("strategy"),
         task.id,
@@ -960,6 +1643,7 @@ def create_task(payload: CreateTaskRequest) -> Task:
     repo.upsert("messages", user_message.model_dump())
     repo.upsert("strategies", strategy.model_dump())
     _touch_session(session)
+    get_cache().set_text(f"task:progress:{task.id}", "waiting_confirmation", ttl_seconds=600)
     repo.audit("task.create", "task", task.id, {"assets": payload.asset_ids})
     return task
 
@@ -984,7 +1668,9 @@ def rate_task(task_id: str, payload: TaskFeedbackRequest) -> TaskFeedback:
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str) -> Dict[str, Any]:
     task = _require_task(task_id)
-    return _task_timeline(task)
+    timeline = _task_timeline(task)
+    timeline["progress"] = get_cache().get_text(f"task:progress:{task.id}") or task.status
+    return timeline
 
 
 @app.get("/api/tasks/{task_id}/events")
@@ -1016,6 +1702,7 @@ def confirm_strategy(task_id: str, payload: ConfirmStrategyRequest) -> Dict[str,
     strategy.confirmed_by = payload.confirmed_by
     strategy.confirmed_at = now_iso()
     assets = [_require_asset(asset_id) for asset_id in task.selected_assets]
+    get_cache().set_text(f"task:progress:{task.id}", "running", ttl_seconds=600)
     result = _workflow().run_confirmed_strategy(
         execution_id=new_id("exec"),
         strategy=strategy,
@@ -1024,6 +1711,7 @@ def confirm_strategy(task_id: str, payload: ConfirmStrategyRequest) -> Dict[str,
     )
     execution = result["execution"]
     task.status = TaskStatus.success if execution.status == "success" else TaskStatus.failed
+    get_cache().set_text(f"task:progress:{task.id}", task.status, ttl_seconds=600)
     task.generated_code = result["code"]
     task.execution_id = execution.execution_id
     task.analysis_summary = result["analysis"]["summary"]
@@ -1422,7 +2110,25 @@ def list_audit_logs(project_id: str = PROJECT_ID, limit: int = 100) -> List[Dict
 
 
 def _workflow() -> AgentWorkflow:
-    return AgentWorkflow(router=ModelRouter(repo.model_config()), rag=LocalRagClient(), sandbox=LocalSandboxExecutor())
+    return AgentWorkflow(router=ModelRouter(repo.model_config()), rag=get_rag_client(), sandbox=LocalSandboxExecutor())
+
+
+def _index_and_graph_asset(asset: Asset) -> None:
+    try:
+        get_rag_client().index_asset(asset)
+    except Exception:
+        pass
+    try:
+        get_graph_store().upsert_asset_graph(asset)
+    except Exception:
+        pass
+
+
+def _asset_graph_payload(asset: Asset) -> Dict[str, Any]:
+    stored = get_graph_store().load_asset_graph(asset.id)
+    if stored and stored.get("nodes"):
+        return stored
+    return asset.graph.model_dump() if hasattr(asset.graph, "model_dump") else {"nodes": asset.graph.nodes, "edges": asset.graph.edges}
 
 
 def _sessions() -> List[Session]:
@@ -1436,6 +2142,167 @@ def _messages(session_id: Optional[str] = None) -> List[Message]:
 
 def _assets() -> List[Asset]:
     return [hydrate_asset(item) for item in repo.all("assets")]
+
+
+def _asset_tags() -> List[AssetTag]:
+    return [hydrate_asset_tag(item) for item in repo.all("asset_tags")]
+
+
+def _datasets() -> List[Dataset]:
+    return [hydrate_dataset(item) for item in repo.all("datasets")]
+
+
+def _normalize_dataset_asset_ids(asset_ids: List[str]) -> List[str]:
+    cleaned: List[str] = []
+    seen = set()
+    missing: List[str] = []
+    for item in asset_ids or []:
+        asset_id = str(item or "").strip()
+        if not asset_id or asset_id in seen:
+            continue
+        raw = repo.get("assets", asset_id)
+        if not raw or raw.get("deleted_at"):
+            missing.append(asset_id)
+            continue
+        seen.add(asset_id)
+        cleaned.append(asset_id)
+    if missing:
+        raise HTTPException(status_code=400, detail=f"数据资产不存在或已删除：{', '.join(missing[:8])}")
+    return cleaned
+
+
+def _ensure_default_tag(project_id: str = PROJECT_ID) -> AssetTag:
+    existing = next(
+        (
+            tag
+            for tag in _asset_tags()
+            if tag.project_id == project_id
+            and not tag.deleted_at
+            and (tag.path == DEFAULT_ASSET_TAG or tag.name.lower() == DEFAULT_ASSET_TAG)
+        ),
+        None,
+    )
+    if existing:
+        changed = False
+        if not existing.is_system:
+            existing.is_system = True
+            changed = True
+        if existing.parent_id:
+            existing.parent_id = None
+            changed = True
+        if existing.path != DEFAULT_ASSET_TAG:
+            existing.path = DEFAULT_ASSET_TAG
+            changed = True
+        if existing.depth != 0:
+            existing.depth = 0
+            changed = True
+        if changed:
+            repo.upsert("asset_tags", existing.model_dump())
+        _normalize_tag_tree(project_id, existing)
+        return existing
+    tag = AssetTag(
+        id=f"tag_{project_id}_{DEFAULT_ASSET_TAG}",
+        project_id=project_id,
+        name=DEFAULT_ASSET_TAG,
+        description="默认公开标签",
+        parent_id=None,
+        path=DEFAULT_ASSET_TAG,
+        depth=0,
+        is_system=True,
+    )
+    repo.upsert("asset_tags", tag.model_dump())
+    _normalize_tag_tree(project_id, tag)
+    return tag
+
+
+def _normalize_tag_tree(project_id: str, root: AssetTag) -> None:
+    """Backfill missing path/depth. Root-level custom tags stay siblings of public."""
+    by_id = {
+        tag.id: tag
+        for tag in _asset_tags()
+        if tag.project_id == project_id and not tag.deleted_at
+    }
+    for tag in by_id.values():
+        if tag.id == root.id:
+            continue
+        changed = False
+        if tag.parent_id and tag.parent_id in by_id:
+            parent = by_id[tag.parent_id]
+            expected_path = f"{parent.path}/{tag.name}"
+            expected_depth = parent.depth + 1
+            if tag.path != expected_path:
+                tag.path = expected_path
+                changed = True
+            if tag.depth != expected_depth:
+                tag.depth = expected_depth
+                changed = True
+        else:
+            # First-level tag (alongside public).
+            if tag.parent_id:
+                tag.parent_id = None
+                changed = True
+            if not tag.path:
+                tag.path = tag.name
+                changed = True
+            if tag.depth != 0:
+                tag.depth = 0
+                changed = True
+            # Legacy paths like public/xxx with missing/invalid parent keep path as-is.
+            if tag.path.startswith(f"{DEFAULT_ASSET_TAG}/") and tag.parent_id is None:
+                # Recover parent link to public when path implies it.
+                tag.parent_id = root.id
+                tag.depth = tag.path.count("/")
+                changed = True
+        if changed:
+            repo.upsert("asset_tags", tag.model_dump())
+
+
+def _ensure_tags_registered(project_id: str, tags: List[str]) -> None:
+    root = _ensure_default_tag(project_id)
+    existing_by_path = {
+        tag.path.lower(): tag
+        for tag in _asset_tags()
+        if tag.project_id == project_id and not tag.deleted_at
+    }
+    existing_by_name = {
+        tag.name.lower(): tag
+        for tag in _asset_tags()
+        if tag.project_id == project_id and not tag.deleted_at
+    }
+    for value in normalize_asset_tags(tags):
+        key = value.lower()
+        if key in existing_by_path or key in existing_by_name:
+            continue
+        # Support path-like values "public/retail/orders".
+        parts = [part.strip() for part in value.split("/") if part.strip()]
+        if not parts:
+            continue
+        parent = root
+        built = root.path
+        for index, part in enumerate(parts):
+            if index == 0 and part.lower() == DEFAULT_ASSET_TAG:
+                parent = root
+                built = root.path
+                continue
+            built = f"{built}/{part}"
+            found = existing_by_path.get(built.lower())
+            if found:
+                parent = found
+                continue
+            created = AssetTag(
+                id=new_id("tag"),
+                project_id=project_id,
+                name=part,
+                description="",
+                parent_id=parent.id,
+                path=built,
+                depth=parent.depth + 1,
+                is_system=False,
+            )
+            repo.upsert("asset_tags", created.model_dump())
+            existing_by_path[built.lower()] = created
+            existing_by_name[part.lower()] = created
+            parent = created
 
 
 def _datasources() -> List[Datasource]:
@@ -1501,6 +2368,20 @@ def _require_asset(asset_id: str) -> Asset:
     if not raw or raw.get("deleted_at"):
         raise HTTPException(status_code=404, detail="asset not found")
     return hydrate_asset(raw)
+
+
+def _require_dataset(dataset_id: str) -> Dataset:
+    raw = repo.get("datasets", dataset_id)
+    if not raw or raw.get("deleted_at"):
+        raise HTTPException(status_code=404, detail="dataset not found")
+    return hydrate_dataset(raw)
+
+
+def _require_asset_tag(tag_id: str) -> AssetTag:
+    raw = repo.get("asset_tags", tag_id)
+    if not raw or raw.get("deleted_at"):
+        raise HTTPException(status_code=404, detail="tag not found")
+    return hydrate_asset_tag(raw)
 
 
 def _require_datasource(datasource_id: str) -> Datasource:

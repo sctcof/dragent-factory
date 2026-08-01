@@ -8,6 +8,9 @@ from packages.shared_types.models import Asset
 class LocalRagClient:
     """Local deterministic RAG adapter with the same contract as a RAGFlow client."""
 
+    def ensure_kb(self, kind: str, name: str) -> str:
+        return f"local-{kind}"
+
     def index_asset(self, asset: Asset) -> List[Dict[str, Any]]:
         if not asset.data_dictionary:
             return []

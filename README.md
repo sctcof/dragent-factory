@@ -2,12 +2,15 @@
 
 基于 `dragent.md` 与 `docs/engineering-architecture.md` 落地的可运行工程实现。系统按六层架构拆分为 Web 工作台、FastAPI 应用服务、多 Agent 编排、模型网关、本地 RAG/图谱适配、数据接入、执行沙箱、报告与看板模块。
 
-## 本地启动
+## 本地启动（轻量 JSON 回退）
+
+默认可不启依赖栈，使用 `local_data/metadata.json` + `LocalRagClient`：
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r apps/api/requirements.txt
+export DRAGENT_STORE=json VECTOR_BACKEND=local
 PYTHONPATH=. uvicorn apps.api.dragent_api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -23,6 +26,43 @@ npm --workspace apps/web run dev
 - Web: http://localhost:3000
 - API: http://localhost:8000/api/health
 - OpenAPI: http://localhost:8000/docs
+
+## 本机目标架构联调
+
+本机 Docker Compose 已覆盖 PostgreSQL(pgvector)、Redis、Neo4j、MinIO、API、Web。RAGFlow 因镜像体积与架构限制，作为独立子栈启动（见 [infra/ragflow/README.md](infra/ragflow/README.md)）。
+
+**硬件建议**：CPU ≥ 4、内存 ≥ 16GB。Apple Silicon 跑官方 RAGFlow 镜像需启用 amd64 模拟，或远端部署后只填 `RAGFLOW_BASE_URL`。
+
+```bash
+cp .env.example .env
+# 按需修改 DRAGENT_STORE / VECTOR_BACKEND / RAGFLOW_* 
+
+docker compose -f infra/docker-compose.yml up --build
+```
+
+常用开关（`.env`）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `DRAGENT_STORE=postgres\|json` | 元数据仓储；Postgres 不可用时 API 会回退 JSON |
+| `VECTOR_BACKEND=ragflow\|local` | RAG 后端；未配置 `RAGFLOW_BASE_URL` 时回退本地关键词检索 |
+| `DATABASE_URL` / `REDIS_URL` / `NEO4J_URI` | 依赖连接串 |
+| `RAGFLOW_BASE_URL` / `RAGFLOW_API_KEY` | 接入独立 RAGFlow |
+
+JSON → PostgreSQL 一次性迁移：
+
+```bash
+export DATABASE_URL=postgresql+psycopg2://dragent:dragent@localhost:5432/dragent
+PYTHONPATH=. python scripts/migrate_json_to_postgres.py
+```
+
+### 联调验收清单
+
+1. `docker compose -f infra/docker-compose.yml up -d` 后访问 `/api/health`，确认 `stack.store_ok` / `redis` / `neo4j`。
+2. 上传 CSV → 资产自动索引；若 `VECTOR_BACKEND=ragflow`，文档进入 RAGFlow KB。
+3. `POST /api/rag/context` 返回检索 chunk；Redis 对相同 query 短缓存。
+4. 多选资产打开整体知识图：优先 Neo4j，失败回退内存合并。
+5. 关闭 RAGFlow / 设 `VECTOR_BACKEND=local` 后 API 仍可用。
 
 ## Docker 部署
 
@@ -72,14 +112,26 @@ docker compose -f infra/docker-compose.ghcr.yml up -d
 
 ## 复杂样例与数据库连接
 
-`examples/retail_complex/` 提供了一个多数据集零售经营样例，包含订单、客户、商品、营销投放、库存五类数据，以及同结构的 SQLite 数据库：
+### 电商交易系统样例（14 表，覆盖全部连接类型）
 
-- `orders.csv`
-- `customers.csv`
-- `products.csv`
-- `marketing.csv`
-- `inventory.csv`
-- `retail_complex.sqlite`
+`examples/ecommerce_platform/` 提供电商交易场景样例（供应商/客户/商品/门店/营销/促销/订单/明细/支付/发货/退货/库存/工单/评价），可灌入平台枚举的全部数据库类型：
+
+`mysql` · `postgresql` · `sqlite` · `clickhouse` · `mssql` · `duckdb`
+
+```bash
+# 可选：启动 ClickHouse / SQL Server / 独立 MySQL 样例库
+docker compose -f infra/docker-compose.sample-dbs.yml up -d
+
+# 生成 CSV、灌库，并注册到连接池（需 API 已启动）
+pip install -r apps/api/requirements.txt
+python scripts/seed_ecommerce_samples.py --create-assets
+```
+
+详见 [examples/ecommerce_platform/README.md](examples/ecommerce_platform/README.md)。
+
+### 轻量零售样例
+
+`examples/retail_complex/` 提供五表零售样例与 SQLite；`examples/retail_deep_dive_10csv/` 提供更大的 10 CSV 深潜集。
 
 推荐分析问题：
 
@@ -93,14 +145,18 @@ docker compose -f infra/docker-compose.ghcr.yml up -d
 mysql+pymysql://user:password@host:3306/database
 postgresql+psycopg2://user:password@host:5432/database
 sqlite:////absolute/path/to/database.db
-```
-
-SQLite 样例可使用绝对路径连接，例如：
-
-```text
-sqlite:////Users/guanwenzheng/Desktop/workspace/dragent-factory/examples/retail_complex/retail_complex.sqlite
+clickhouse+native://default:@host:9004/ecommerce
+mssql+pymssql://sa:password@host:1433/ecommerce
+duckdb:////absolute/path/to/database.duckdb
 ```
 
 ## 工程边界
 
-本地 MVP 使用 `local_data/metadata.json` 和 `local_data/objects` 作为元数据与对象存储事实源，以确定性 Agent 替代真实 LLM 调用。RAGFlow、图数据库、PostgreSQL、Redis、Docker 沙箱均保留独立适配边界，生产替换时不需要改动前端协议和 API 路径。
+- 元数据：`DRAGENT_STORE=json` 用 `local_data/metadata.json`；`postgres` 用 PostgreSQL `documents` / `chunks` / `knowledge_bases`。
+- 对象文件：短期仍落 `local_data/objects`（Compose 已提供 MinIO 供后续切换）。
+- RAG：`RagFlowClient` / `LocalRagClient` 工厂切换，接口兼容。
+- 图谱：Neo4j 优先，失败回退资产内嵌 `KnowledgeGraph`。
+- Redis：RAG 缓存与任务进度，连接失败自动降级。
+- Agent：仍以确定性实现为主；真实 LLM 可并行接入，不阻塞本栈。
+- 沙箱：仍为本地 subprocess；Firecracker/Docker 池属后续阶段。
+
