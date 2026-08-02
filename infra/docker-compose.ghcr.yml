@@ -1,6 +1,7 @@
 services:
   api:
     image: ${DRAGENT_API_IMAGE:-ghcr.io/OWNER/REPOSITORY-api:latest}
+    restart: unless-stopped
     environment:
       PYTHONPATH: /app
     ports:
@@ -10,6 +11,7 @@ services:
 
   web:
     image: ${DRAGENT_WEB_IMAGE:-ghcr.io/OWNER/REPOSITORY-web:latest}
+    restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
     ports:
@@ -19,4 +21,3 @@ services:
 
 volumes:
   dragent_data:
-

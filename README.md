@@ -74,13 +74,11 @@ docker compose -f infra/docker-compose.yml up --build
 
 项目包含 `.github/workflows/deploy.yml`。推送到 `main` 后，GitHub Actions 会执行：
 
-- Python 后端依赖安装与编译校验。
-- Next.js 前端构建校验。
-- 构建并发布 API 镜像到 `ghcr.io/<owner>/<repo>-api:latest`。
-- 构建并发布 Web 镜像到 `ghcr.io/<owner>/<repo>-web:latest`。
-- 创建 `github-container-registry` GitHub deployment 状态。
+1. Python / Next.js 校验
+2. 构建并发布镜像到 GHCR（`*-api` / `*-web`，带 `latest` 与 commit SHA 标签）
+3. （可选）SSH 到目标机器拉取镜像并 `docker compose up -d`
 
-部署后可使用 GHCR 镜像运行：
+### 手动用 GHCR 镜像运行
 
 ```bash
 export DRAGENT_API_IMAGE=ghcr.io/<owner>/<repo>-api:latest
@@ -88,6 +86,47 @@ export DRAGENT_WEB_IMAGE=ghcr.io/<owner>/<repo>-web:latest
 export NEXT_PUBLIC_API_BASE=http://localhost:8000
 docker compose -f infra/docker-compose.ghcr.yml up -d
 ```
+
+### 推到 main 后自动 SSH 部署
+
+在仓库 **Settings → Secrets and variables → Actions** 配置：
+
+**Repository variables**
+
+| Name | 示例 | 说明 |
+|------|------|------|
+| `ENABLE_SSH_DEPLOY` | `true` | 设为 `true` 才执行 SSH 部署 |
+| `DEPLOY_PATH` | `/opt/dragent-factory` | 服务器上的部署目录，默认 `/opt/dragent-factory` |
+| `DEPLOY_SSH_PORT` | `22` | SSH 端口，默认 `22` |
+| `DEPLOY_URL` | `https://app.example.com` | GitHub Environment 展示用访问地址 |
+| `NEXT_PUBLIC_API_BASE` | `https://api.example.com` | 前端构建期与运行期 API 地址 |
+
+**Repository secrets**
+
+| Name | 说明 |
+|------|------|
+| `DEPLOY_HOST` | 服务器 IP 或域名 |
+| `DEPLOY_USER` | SSH 用户名（需能跑 `docker` / `docker compose`） |
+| `DEPLOY_SSH_KEY` | 该用户的 SSH **私钥**全文 |
+| `GHCR_READ_TOKEN` | 可选；私有镜像拉取用，PAT 需 `read:packages` |
+| `GHCR_USERNAME` | 可选；默认仓库 owner，配合 `GHCR_READ_TOKEN` |
+
+并在 **Settings → Environments** 创建（或沿用 workflow 自动使用的）环境：
+
+- `github-container-registry`：镜像发布
+- `production`：SSH 部署（可开 Required reviewers）
+
+**服务器一次性准备**
+
+```bash
+# 安装 Docker + Compose 插件，并把部署用户加入 docker 组
+sudo mkdir -p /opt/dragent-factory
+sudo chown "$USER" /opt/dragent-factory
+```
+
+启用后流程为：`push main` → Actions 校验 → 推镜像到 GHCR → `scp` 同步 `docker-compose.ghcr.yml` 与 `remote-up.sh` → SSH 执行拉取并重启。
+
+未设置 `ENABLE_SSH_DEPLOY=true` 时，只会发布镜像，不会连服务器。
 
 ## 已覆盖能力
 
@@ -103,6 +142,8 @@ docker compose -f infra/docker-compose.ghcr.yml up -d
 ## 操作分析流程
 
 首页与工作台围绕“业务目标 → 策略 → 执行 → 图表 → 报告”的闭环设计。推荐按下面 6 步使用：
+
+![Data-RAG-Agent 操作分析流程](docs/images/home-operation-flow.png)
 
 1. **接入数据**：在对话框点击回形针，选择已有数据资产或上传新的 CSV / Excel；也可以进入数据资产页创建 MySQL、PostgreSQL、SQLite 等数据库连接并生成数据资产。
 2. **补充上下文**：选中数据资产后，系统会读取数据字典、字段画像、元数据、图谱关系和 RAG 检索结果，自动补充到当前分析上下文。

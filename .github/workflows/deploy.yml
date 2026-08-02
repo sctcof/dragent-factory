@@ -42,11 +42,14 @@ jobs:
       - name: Build web
         run: npm --workspace apps/web run build
 
-  deploy:
-    name: Publish GitHub deployment
+  publish:
+    name: Publish images to GHCR
     runs-on: ubuntu-latest
     needs: validate
     if: github.ref == 'refs/heads/main'
+    outputs:
+      api_image: ${{ steps.images.outputs.api }}
+      web_image: ${{ steps.images.outputs.web }}
     environment:
       name: github-container-registry
       url: https://github.com/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}-web
@@ -150,3 +153,70 @@ jobs:
               description: "GitHub deployment failed"
             });
 
+  ssh-deploy:
+    name: SSH deploy to server
+    runs-on: ubuntu-latest
+    needs: publish
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_SSH_DEPLOY == 'true'
+    environment:
+      name: production
+      url: ${{ vars.DEPLOY_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add host to known_hosts
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_SSH_PORT }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -p "${DEPLOY_PORT:-22}" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync deploy files
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_SSH_PORT }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          port="${DEPLOY_PORT:-22}"
+          path="${DEPLOY_PATH:-/opt/dragent-factory}"
+          ssh -p "$port" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$path'"
+          scp -P "$port" \
+            infra/docker-compose.ghcr.yml \
+            infra/deploy/remote-up.sh \
+            "$DEPLOY_USER@$DEPLOY_HOST:$path/"
+          ssh -p "$port" "$DEPLOY_USER@$DEPLOY_HOST" "chmod +x '$path/remote-up.sh'"
+
+      - name: Pull images and restart stack
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_SSH_PORT }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          API_IMAGE: ${{ needs.publish.outputs.api_image }}:${{ github.sha }}
+          WEB_IMAGE: ${{ needs.publish.outputs.web_image }}:${{ github.sha }}
+          NEXT_PUBLIC_API_BASE: ${{ vars.NEXT_PUBLIC_API_BASE }}
+          DEPLOY_URL: ${{ vars.DEPLOY_URL }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          port="${DEPLOY_PORT:-22}"
+          path="${DEPLOY_PATH:-/opt/dragent-factory}"
+          api_base="${NEXT_PUBLIC_API_BASE:-${DEPLOY_URL:-http://localhost:8000}}"
+          ghcr_user="${GHCR_USERNAME:-${{ github.repository_owner }}}"
+          ssh -p "$port" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "DEPLOY_PATH='$path' \
+             DRAGENT_API_IMAGE='$API_IMAGE' \
+             DRAGENT_WEB_IMAGE='$WEB_IMAGE' \
+             NEXT_PUBLIC_API_BASE='$api_base' \
+             GHCR_USERNAME='$ghcr_user' \
+             GHCR_TOKEN='$GHCR_TOKEN' \
+             bash '$path/remote-up.sh'"
