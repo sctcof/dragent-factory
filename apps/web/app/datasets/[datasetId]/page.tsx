@@ -73,7 +73,7 @@ export default function DatasetKnowledgeGraphPage({ params }: { params: { datase
         use_new_strategy: "1",
         prompt: planQuestions[0] || "",
       });
-      window.location.href = `/?${search.toString()}`;
+      window.location.href = `/workspace?${search.toString()}`;
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "带入分析会话失败");
       setBusy(false);

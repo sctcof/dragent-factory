@@ -123,7 +123,7 @@ export default function StrategiesPage() {
   return (
     <main className="detailPage">
       <header className="detailTopbar">
-        <a className="linkButton" href="/"><ArrowLeft size={16} /> 返回对话</a>
+        <a className="linkButton" href="/workspace"><ArrowLeft size={16} /> 返回对话</a>
         <div className="buttonRow">
           <button onClick={refresh}>刷新</button>
           <button onClick={openMerge}><GitBranch size={16} /> 合并已有</button>

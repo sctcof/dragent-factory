@@ -83,7 +83,7 @@ export default function ReportPage({ params }: { params: { reportId: string } })
     return (
       <main className="reportPage">
         <div className="detailTopbar">
-          <a className="linkButton" href="/"><ArrowLeft size={16} /> 返回</a>
+          <a className="linkButton" href="/workspace"><ArrowLeft size={16} /> 返回</a>
           <span>{notice}</span>
         </div>
       </main>
@@ -93,7 +93,7 @@ export default function ReportPage({ params }: { params: { reportId: string } })
   return (
     <main className="reportPage">
       <header className="reportToolbar">
-        <a className="linkButton" href="/"><ArrowLeft size={16} /> 返回对话</a>
+        <a className="linkButton" href="/workspace"><ArrowLeft size={16} /> 返回对话</a>
         <div className="buttonRow">
           <button disabled={busy || !detail.items.length} onClick={generateStrategy}>
             <Sparkles size={16} /> 生成分析策略

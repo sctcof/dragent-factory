@@ -56,7 +56,7 @@ export default function SessionsPage() {
     setNotice("正在复制会话上下文");
     try {
       const cloned = await api.cloneSession(session.id, `${session.title} 续聊`);
-      window.location.href = `/?session_id=${cloned.id}`;
+      window.location.href = `/workspace?session_id=${cloned.id}`;
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "复制会话失败");
       setBusySessionId(null);
@@ -66,7 +66,7 @@ export default function SessionsPage() {
   return (
     <main className="detailPage">
       <header className="detailTopbar">
-        <a className="linkButton" href="/"><ArrowLeft size={16} /> 返回对话</a>
+        <a className="linkButton" href="/workspace"><ArrowLeft size={16} /> 返回对话</a>
         <button onClick={refresh}><RefreshCw size={16} /> 刷新</button>
       </header>
 
@@ -83,7 +83,7 @@ export default function SessionsPage() {
         <div className="assetTable">
           {sessions.map((session) => (
             <article key={session.id} className="assetTableRow">
-              <a href={`/?session_id=${session.id}`}>
+              <a href={`/workspace?session_id=${session.id}`}>
                 <strong>{session.title}</strong>
                 <span>最近活跃 {session.last_active_at?.slice(0, 10) || "-"}</span>
               </a>
@@ -94,7 +94,7 @@ export default function SessionsPage() {
                 ) : (
                   <button disabled={busySessionId === session.id} onClick={() => cloneSession(session)}><Copy size={15} /> 复制继续</button>
                 )}
-                <a className="linkButton" href={`/?session_id=${session.id}`}>{session.archived_at ? "查看" : "继续对话"}</a>
+                <a className="linkButton" href={`/workspace?session_id=${session.id}`}>{session.archived_at ? "查看" : "继续对话"}</a>
                 <button className="dangerButton" disabled={busySessionId === session.id} onClick={() => removeSession(session.id, session.title)}><Trash2 size={15} /> 删除</button>
               </div>
             </article>

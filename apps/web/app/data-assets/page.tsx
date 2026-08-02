@@ -803,7 +803,7 @@ export default function DataAssetsPage() {
         use_new_strategy: "1",
         prompt: questions[0] || "",
       });
-      window.location.href = `/?${search.toString()}`;
+      window.location.href = `/workspace?${search.toString()}`;
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "带入分析会话失败");
       setBusy(false);
@@ -819,7 +819,7 @@ export default function DataAssetsPage() {
       dataset_ids: dataset.id,
       prompt: `请基于数据集「${dataset.name}」开展分析`,
     });
-    window.location.href = `/?${search.toString()}`;
+    window.location.href = `/workspace?${search.toString()}`;
   }
 
   async function loadDatasourceTables(datasourceId: string) {
@@ -1051,7 +1051,7 @@ export default function DataAssetsPage() {
   return (
     <main className="dataAssetsPage">
       <header className="detailTopbar">
-        <a className="linkButton" href="/"><ArrowLeft size={16} /> 返回对话</a>
+        <a className="linkButton" href="/workspace"><ArrowLeft size={16} /> 返回对话</a>
         <span>{notice}</span>
         <button onClick={() => void refresh()}>刷新</button>
       </header>

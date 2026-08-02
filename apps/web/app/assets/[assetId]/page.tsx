@@ -21,14 +21,14 @@ export default function AssetDetailPage({ params }: { params: { assetId: string 
 
   async function removeAsset() {
     await api.deleteAsset(params.assetId);
-    window.location.href = "/";
+    window.location.href = "/workspace";
   }
 
   if (!detail) {
     return (
       <main className="detailPage">
         <div className="detailTopbar">
-          <a className="linkButton" href="/"><ArrowLeft size={16} /> 返回</a>
+          <a className="linkButton" href="/workspace"><ArrowLeft size={16} /> 返回</a>
           <span>{notice}</span>
         </div>
       </main>
@@ -38,7 +38,7 @@ export default function AssetDetailPage({ params }: { params: { assetId: string 
   return (
     <main className="detailPage">
       <header className="detailTopbar">
-        <a className="linkButton" href="/"><ArrowLeft size={16} /> 返回对话</a>
+        <a className="linkButton" href="/workspace"><ArrowLeft size={16} /> 返回对话</a>
         <button onClick={removeAsset}><Trash2 size={16} /> 删除资产</button>
       </header>
 

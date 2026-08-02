@@ -27,7 +27,7 @@ export default function ReportsPage() {
   return (
     <main className="detailPage">
       <header className="detailTopbar">
-        <a className="linkButton" href="/"><ArrowLeft size={16} /> 返回对话</a>
+        <a className="linkButton" href="/workspace"><ArrowLeft size={16} /> 返回对话</a>
         <button onClick={refresh}><RefreshCw size={16} /> 刷新</button>
       </header>
 

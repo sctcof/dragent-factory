@@ -123,6 +123,7 @@ export function RecommendedQuestionsPanel({
                 checked={checked}
                 onChange={() => toggleQuestion(question)}
               />
+              <span className="questionCheck" aria-hidden="true" />
               <strong>{index + 1}</strong>
               <span>{question}</span>
             </label>
