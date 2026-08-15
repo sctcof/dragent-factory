@@ -33,11 +33,42 @@ class PlannerAgent:
         feedback_context: List[Dict[str, Any]] | None = None,
     ) -> Strategy:
         context = self.rag.retrieve(intent, assets)
+        selected_templates = _rank_strategy_templates(intent, strategy_templates or [])
+        heuristic = self._heuristic_strategy(
+            strategy_id=strategy_id,
+            task_id=task_id,
+            intent=intent,
+            assets=assets,
+            context=context,
+            selected_templates=selected_templates,
+            feedback_context=feedback_context,
+        )
+        llm_strategy = self._llm_strategy(
+            strategy_id=strategy_id,
+            task_id=task_id,
+            intent=intent,
+            assets=assets,
+            context=context,
+            selected_templates=selected_templates,
+            feedback_context=feedback_context,
+            fallback=heuristic,
+        )
+        return llm_strategy or heuristic
+
+    def _heuristic_strategy(
+        self,
+        strategy_id: str,
+        task_id: str,
+        intent: str,
+        assets: List[Asset],
+        context: List[Dict[str, Any]],
+        selected_templates: List[StrategyTemplate],
+        feedback_context: List[Dict[str, Any]] | None,
+    ) -> Strategy:
         dimensions = _choose_dimensions(assets, intent)
         metrics = _choose_metrics(assets, intent)
         if not metrics:
             metrics = ["row_count"]
-        selected_templates = _rank_strategy_templates(intent, strategy_templates or [])
         methods = _choose_methods(intent, dimensions, metrics, selected_templates)
         chart_suggestions = [
             {
@@ -50,25 +81,10 @@ class PlannerAgent:
         if metrics:
             chart_suggestions.append({"type": "metric", "title": f"核心指标 {metrics[0]}", "metrics": [metrics[0]]})
         assumptions = [
-            "本地开发模式使用确定性启发式 Agent，生产可通过 llm_gateway 替换为真实模型。",
+            "策略来源：本地启发式 Planner（未调用外部模型或调用失败时回退）。",
             "所有新结论必须来自执行结果或 Supporting IDs，未证实推断只进入备注。",
         ]
-        if context:
-            asset_names = {
-                asset.id: asset.name
-                for asset in assets
-            }
-            matched_names = []
-            for item in context:
-                name = asset_names.get(item.get("asset_id"))
-                if name and name not in matched_names:
-                    matched_names.append(name)
-            assumptions.append("策略参考了数据字典：" + "、".join(matched_names[:3] or [asset.name for asset in assets[:1]]))
-        if selected_templates:
-            assumptions.append("策略资产引用：" + "、".join(template.title for template in selected_templates[:3]))
-        if feedback_context:
-            assumptions.append(f"纳入 {len(feedback_context)} 条已认可问答作为个性化策略参考。")
-        assumptions.append(_method_fit_note(intent))
+        assumptions.extend(_shared_strategy_assumptions(assets, context, selected_templates, feedback_context, intent))
         return Strategy(
             id=strategy_id,
             task_id=task_id,
@@ -83,20 +99,135 @@ class PlannerAgent:
             rag_context=context[:6],
         )
 
+    def _llm_strategy(
+        self,
+        strategy_id: str,
+        task_id: str,
+        intent: str,
+        assets: List[Asset],
+        context: List[Dict[str, Any]],
+        selected_templates: List[StrategyTemplate],
+        feedback_context: List[Dict[str, Any]] | None,
+        fallback: Strategy,
+    ) -> Strategy | None:
+        schema = _asset_field_schema(assets)
+        if not schema:
+            return None
+        system_prompt = (
+            "你是数据分析策略规划助手。根据用户分析意图与可用字段，输出可执行的分析策略 JSON。"
+            "规则：dimensions/metrics 只能从可用字段中选择；methods 用中文步骤，3-6 条；"
+            "chart_suggestions 为数组，每项含 type/title/dimensions/metrics；"
+            "禁止编造不存在的字段。输出 JSON："
+            '{"objective":"...","dimensions":[],"metrics":[],"methods":[],'
+            '"chart_suggestions":[{"type":"bar","title":"...","dimensions":[],"metrics":[]}],'
+            '"assumptions":["..."]}'
+        )
+        user_prompt = (
+            f"分析意图：{intent}\n"
+            f"可用字段：{json.dumps(schema, ensure_ascii=False)}\n"
+            f"启发式参考维度：{fallback.dimensions}\n"
+            f"启发式参考指标：{fallback.metrics}\n"
+            f"策略模板：{[template.title for template in selected_templates[:3]]}\n"
+            f"RAG 上下文摘要：{json.dumps(context[:4], ensure_ascii=False, default=str)[:2500]}"
+        )
+        result, envelope = self.router.generate_json("planner", system_prompt, user_prompt)
+        model_name = str(envelope.get("model") or "unknown")
+        if not isinstance(result, dict):
+            fallback.assumptions = [
+                f"策略来源：本地启发式（模型 {model_name} 未调用成功"
+                + (f"：{envelope.get('reason')}" if envelope.get("reason") else "")
+                + "）。",
+                *fallback.assumptions[1:],
+            ]
+            return None
+
+        allowed_fields = {item["name"] for item in schema}
+        dimensions = [
+            name for name in _as_str_list(result.get("dimensions")) if name in allowed_fields
+        ] or list(fallback.dimensions)
+        metrics = [
+            name for name in _as_str_list(result.get("metrics")) if name in allowed_fields or name == "row_count"
+        ] or list(fallback.metrics)
+        if not metrics:
+            metrics = ["row_count"]
+        methods = _as_str_list(result.get("methods")) or list(fallback.methods)
+        chart_suggestions = _normalize_chart_suggestions(
+            result.get("chart_suggestions"),
+            dimensions=dimensions,
+            metrics=metrics,
+            fallback=fallback.chart_suggestions,
+        )
+        assumptions = [
+            f"策略来源：外部模型 {model_name}（planner · {envelope.get('status')} · {envelope.get('latency_ms', 0)}ms）。",
+            "所有新结论必须来自执行结果或 Supporting IDs，未证实推断只进入备注。",
+        ]
+        assumptions.extend(_as_str_list(result.get("assumptions"))[:4])
+        assumptions.extend(_shared_strategy_assumptions(assets, context, selected_templates, feedback_context, intent))
+        objective = str(result.get("objective") or intent).strip() or intent
+        return Strategy(
+            id=strategy_id,
+            task_id=task_id,
+            objective=objective,
+            dimensions=dimensions[:4],
+            metrics=metrics[:5],
+            methods=methods[:6],
+            chart_suggestions=chart_suggestions,
+            evidence_policy=fallback.evidence_policy,
+            assumptions=assumptions,
+            source_strategy_ids=[template.id for template in selected_templates],
+            rag_context=context[:6],
+        )
+
 
 class CoderAgent:
     def __init__(self, router: ModelRouter) -> None:
         self.router = router
 
     def generate_python(self, strategy: Strategy, assets: List[Asset]) -> str:
-        primary_asset = assets[0]
-        dictionary = primary_asset.data_dictionary
         dimensions = strategy.dimensions
         metrics = [metric for metric in strategy.metrics if metric != "row_count"]
         first_dimension = dimensions[0] if dimensions else None
         first_metric = metrics[0] if metrics else None
+
+        def _asset_has_column(asset: Asset, column_name: str | None) -> bool:
+            if not column_name or not asset.data_dictionary:
+                return False
+            return any(column.name == column_name for column in asset.data_dictionary.columns)
+
+        # 主数据集应优先包含首个维度 + 首个指标；否则依次放宽：含指标、含维度、默认第一个
+        candidates = [
+            asset
+            for asset in assets
+            if _asset_has_column(asset, first_metric) and _asset_has_column(asset, first_dimension)
+        ]
+        if not candidates:
+            candidates = [asset for asset in assets if _asset_has_column(asset, first_metric)]
+        if not candidates:
+            candidates = [asset for asset in assets if _asset_has_column(asset, first_dimension)]
+        if not candidates:
+            candidates = assets
+        primary_asset = candidates[0]
+
+        dictionary = primary_asset.data_dictionary
         suggested_chart_type = str((strategy.chart_suggestions[0] if strategy.chart_suggestions else {}).get("type", "bar"))
-        selected_chart_type = suggested_chart_type if suggested_chart_type in {"line", "bar", "pie", "heatmap"} else "bar"
+        supported_chart_types = {
+            "line",
+            "bar",
+            "area",
+            "pie",
+            "doughnut",
+            "rose",
+            "heatmap",
+            "scatter",
+            "stacked_bar",
+            "horizontal_bar",
+            "radar",
+            "gauge",
+            "funnel",
+            "treemap",
+            "table",
+        }
+        selected_chart_type = suggested_chart_type if suggested_chart_type in supported_chart_types else "bar"
         rows_hint = dictionary.row_count if dictionary else 0
         asset_meta = [
             {
@@ -199,17 +330,34 @@ else:
     }})
     process_steps.append({{"step": 3, "name": "总体规模统计", "detail": "未识别到可聚合维度和指标，输出行数指标卡。"}})
 
-if quality_table:
+# 「对比」类图至少需要 2 个数据集，单资产时改为指标卡，避免出现单柱难看图
+if len(quality_table) >= 2:
     charts.append({{
         "id": "chart_asset_quality",
-        "type": selected_chart_type,
+        "type": selected_chart_type if selected_chart_type in {{"bar", "horizontal_bar", "pie", "doughnut"}} else "bar",
         "title": "各数据集记录数对比",
         "x_field": "asset",
         "y_fields": ["rows"],
         "dataset": quality_table,
-        "insight": "用于检查多数据集规模差异和后续 join 风险。"
+        "insight": "对比多数据集规模差异，评估后续 join 匹配与口径风险。"
     }})
-process_steps.append({{"step": 6, "name": "跨数据集一致性检查", "detail": "对比多数据集规模和字段覆盖，识别可能的连接与口径风险。"}})
+    process_steps.append({{"step": 6, "name": "跨数据集一致性检查", "detail": f"对比 {{len(quality_table)}} 个数据集的行数/列数/缺失率。"}})
+elif len(quality_table) == 1:
+    item = quality_table[0]
+    charts.append({{
+        "id": "chart_asset_quality",
+        "type": "metric",
+        "title": f"{{item.get('asset', '当前数据集')}} 记录数",
+        "dataset": [{{"rows": item.get("rows", 0)}}],
+        "y_fields": ["rows"],
+        "insight": (
+            f"当前仅 1 个数据集（{{item.get('rows', 0)}} 行 / {{item.get('columns', 0)}} 列）。"
+            "多数据集规模对比需选择至少 2 个分析资产。"
+        )
+    }})
+    process_steps.append({{"step": 6, "name": "数据规模核对", "detail": "仅 1 个数据集，输出规模指标卡（对比图需 ≥2 个资产）。"}})
+else:
+    process_steps.append({{"step": 6, "name": "跨数据集一致性检查", "detail": "未生成质量画像，跳过数据集对比。"}})
 process_steps.append({{"step": 7, "name": "业务结论生成", "detail": "将聚合结果、贡献拆解和质量风险汇总为可追溯结论。"}})
 
 payload = {{
@@ -243,8 +391,12 @@ class AnalyzerAgent:
         facts = _execution_facts(strategy, execution)
         findings = _data_findings(strategy, execution, facts)
         narrative = _goal_narrative(strategy, execution, facts, findings)
+        model_note = "结论来源：本地启发式 Analyzer。"
         if self.router is not None:
-            llm_summary = _llm_analysis_summary(self.router, strategy, execution, facts, findings)
+            llm_summary, envelope = _llm_analysis_summary(self.router, strategy, execution, facts, findings)
+            model_name = str((envelope or {}).get("model") or "unknown")
+            status = str((envelope or {}).get("status") or "fallback")
+            latency = int((envelope or {}).get("latency_ms") or 0)
             if llm_summary:
                 narrative = llm_summary.get("summary") or narrative
                 llm_findings = [
@@ -254,6 +406,14 @@ class AnalyzerAgent:
                 ]
                 if llm_findings:
                     findings = llm_findings[:6]
+                model_note = f"结论来源：外部模型 {model_name}（analyzer · {status} · {latency}ms）。"
+            else:
+                reason = (envelope or {}).get("reason")
+                model_note = (
+                    f"结论来源：本地启发式（模型 {model_name} 未调用成功"
+                    + (f"：{reason}" if reason else "")
+                    + "）。"
+                )
 
         charts = _enrich_chart_insights(execution.charts, strategy, findings)
         summary_lines = [narrative]
@@ -262,6 +422,7 @@ class AnalyzerAgent:
             summary_lines.append("关键发现：")
             summary_lines.extend(f"- {item}" for item in findings)
         summary_lines.append("")
+        summary_lines.append(model_note)
         summary_lines.append("结论仅基于本次执行结果与已解析数据字典，未覆盖未进入本次计算的字段与样本。")
         return {
             "summary": "\n".join(summary_lines).strip(),
@@ -523,7 +684,7 @@ def _llm_analysis_summary(
     execution: ExecutionResult,
     facts: Dict[str, Any],
     findings: List[str],
-) -> Dict[str, Any] | None:
+) -> tuple[Dict[str, Any] | None, Dict[str, Any]]:
     sample_rows = (execution.table or [])[:12]
     system_prompt = (
         "你是数据分析结论助手。请根据用户分析目标与真实执行结果，生成简洁、可核对的中文结论。"
@@ -540,13 +701,112 @@ def _llm_analysis_summary(
         f"启发式发现：{json.dumps(findings, ensure_ascii=False)}\n"
         f"结果样例（最多12行）：{json.dumps(sample_rows, ensure_ascii=False, default=str)}"
     )
-    result, _envelope = router.generate_json("analyzer", system_prompt, user_prompt)
+    result, envelope = router.generate_json("analyzer", system_prompt, user_prompt)
     if not isinstance(result, dict):
-        return None
+        return None, envelope
     summary = str(result.get("summary") or "").strip()
     if not summary:
-        return None
-    return result
+        return None, envelope
+    return result, envelope
+
+
+def _shared_strategy_assumptions(
+    assets: List[Asset],
+    context: List[Dict[str, Any]],
+    selected_templates: List[StrategyTemplate],
+    feedback_context: List[Dict[str, Any]] | None,
+    intent: str,
+) -> List[str]:
+    assumptions: List[str] = []
+    if context:
+        asset_names = {asset.id: asset.name for asset in assets}
+        matched_names: List[str] = []
+        for item in context:
+            name = asset_names.get(item.get("asset_id"))
+            if name and name not in matched_names:
+                matched_names.append(name)
+        assumptions.append(
+            "策略参考了数据字典：" + "、".join(matched_names[:3] or [asset.name for asset in assets[:1]])
+        )
+    if selected_templates:
+        assumptions.append("策略资产引用：" + "、".join(template.title for template in selected_templates[:3]))
+    if feedback_context:
+        assumptions.append(f"纳入 {len(feedback_context)} 条已认可问答作为个性化策略参考。")
+    assumptions.append(_method_fit_note(intent))
+    return assumptions
+
+
+def _asset_field_schema(assets: List[Asset]) -> List[Dict[str, str]]:
+    schema: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for asset in assets:
+        if not asset.data_dictionary:
+            continue
+        for column in asset.data_dictionary.columns:
+            if column.name in seen:
+                continue
+            seen.add(column.name)
+            schema.append(
+                {
+                    "name": column.name,
+                    "logical_type": column.logical_type,
+                    "asset": asset.name,
+                }
+            )
+    return schema
+
+
+def _as_str_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _normalize_chart_suggestions(
+    value: Any,
+    dimensions: List[str],
+    metrics: List[str],
+    fallback: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        return list(fallback)
+    supported = {
+        "line",
+        "bar",
+        "area",
+        "pie",
+        "doughnut",
+        "rose",
+        "heatmap",
+        "scatter",
+        "stacked_bar",
+        "horizontal_bar",
+        "radar",
+        "gauge",
+        "funnel",
+        "treemap",
+        "table",
+        "metric",
+    }
+    suggestions: List[Dict[str, Any]] = []
+    for item in value[:4]:
+        if not isinstance(item, dict):
+            continue
+        chart_type = str(item.get("type") or "bar").strip()
+        if chart_type not in supported:
+            chart_type = "bar"
+        dims = [name for name in _as_str_list(item.get("dimensions")) if name in dimensions] or dimensions[:2]
+        mets = [name for name in _as_str_list(item.get("metrics")) if name in metrics] or metrics[:2]
+        title = str(item.get("title") or "").strip() or f"{'/'.join(mets[:2] or ['指标'])} 分析"
+        suggestions.append(
+            {
+                "type": chart_type,
+                "title": title,
+                "dimensions": dims,
+                "metrics": mets,
+            }
+        )
+    return suggestions or list(fallback)
 
 
 def _enrich_chart_insights(

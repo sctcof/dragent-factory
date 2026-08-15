@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from packages.agent_graph import AgentWorkflow
 from packages.llm_gateway import ModelRouter
+from packages.llm_gateway.router import resolve_llm_gateway
 from packages.sandbox_client import LocalSandboxExecutor
 from packages.shared_types.models import (
     DEFAULT_ASSET_TAG,
@@ -21,12 +23,17 @@ from packages.shared_types.models import (
     ChartConfig,
     Dashboard,
     DashboardItem,
+    DataDictionary,
     Dataset,
     Datasource,
     ExecutionResult,
+    KnowledgeGraph,
     Message,
+    ModelCatalogEntry,
     ModelConfig,
     QueryBinding,
+    default_model_catalog,
+    recommended_gateway_presets,
     Report,
     ReportVersion,
     Session,
@@ -94,6 +101,7 @@ class CreateTaskRequest(BaseModel):
     message: str
     asset_ids: List[str]
     strategy_asset_ids: List[str] = []
+    preferred_model: Optional[str] = None
     agent_model_config: Optional[Dict[str, str]] = Field(default=None, alias="model_config")
 
 
@@ -135,6 +143,10 @@ class ReportModuleRequest(BaseModel):
 
 class CreateReportFromModuleRequest(ReportModuleRequest):
     report_title: Optional[str] = None
+
+
+class ReportUpdateRequest(BaseModel):
+    title: Optional[str] = None
 
 
 class DashboardRequest(BaseModel):
@@ -306,6 +318,118 @@ def health() -> Dict[str, Any]:
     }
 
 
+def _mask_connection_url(url: str) -> str:
+    """隐藏连接串中的密码，仅用于展示。"""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(url)
+        if parts.password:
+            host = parts.hostname or ""
+            netloc = host + (f":{parts.port}" if parts.port else "")
+            if parts.username:
+                netloc = f"{parts.username}:****@{netloc}"
+            return urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
+    except Exception:
+        pass
+    return url
+
+
+@app.get("/api/system-config")
+def system_config() -> Dict[str, Any]:
+    """当前系统的基础服务配置与连通性状态。"""
+    from .config import (
+        DATABASE_URL,
+        DB_PATH,
+        DRAGENT_STORE,
+        NEO4J_PASSWORD,
+        NEO4J_URI,
+        NEO4J_USER,
+        OBJECT_ROOT,
+        RAGFLOW_API_KEY,
+        RAGFLOW_BASE_URL,
+        REDIS_URL,
+        VECTOR_BACKEND,
+    )
+
+    cache = get_cache()
+    graph = get_graph_store()
+    store_ok = True
+    try:
+        repo.all("assets")
+    except Exception:
+        store_ok = False
+
+    ragflow: Dict[str, Any] = {"configured": bool(RAGFLOW_BASE_URL), "base_url": RAGFLOW_BASE_URL, "api_key_set": bool(RAGFLOW_API_KEY)}
+    if VECTOR_BACKEND == "ragflow" and RAGFLOW_BASE_URL:
+        from packages.rag_client.ragflow_client import RagFlowClient
+
+        client = RagFlowClient(base_url=RAGFLOW_BASE_URL, api_key=RAGFLOW_API_KEY, project_id=PROJECT_ID)
+        try:
+            datasets = client.list_datasets()
+            ragflow["reachable"] = True
+            ragflow["kb_count"] = len(datasets)
+            target = next((item for item in datasets if item.get("name") == f"dragent-{PROJECT_ID}-dict"), None)
+            if target:
+                ragflow["kb"] = {
+                    "id": target.get("id"),
+                    "name": target.get("name"),
+                    "docs": target.get("document_count"),
+                    "chunks": target.get("chunk_count"),
+                    "embedding_model": target.get("embedding_model"),
+                }
+        except Exception as exc:  # noqa: BLE001
+            ragflow["reachable"] = False
+            ragflow["error"] = str(exc)[:200]
+    else:
+        ragflow["reachable"] = None
+
+    datasources = [item for item in _datasources() if not item.deleted_at]
+    return {
+        "app": {"title": app.title, "version": app.version},
+        "project_id": PROJECT_ID,
+        "time": now_iso(),
+        "storage": {
+            "mode": DRAGENT_STORE,
+            "ok": store_ok,
+            "metadata_path": str(DB_PATH),
+            "database_url": _mask_connection_url(DATABASE_URL) if DRAGENT_STORE == "postgres" else "",
+        },
+        "vector": {
+            "backend": VECTOR_BACKEND,
+            "ragflow": ragflow,
+        },
+        "cache": {
+            "redis_url": _mask_connection_url(REDIS_URL),
+            "reachable": cache.ping() if hasattr(cache, "ping") else False,
+        },
+        "graph": {
+            "neo4j_uri": NEO4J_URI,
+            "neo4j_user": NEO4J_USER,
+            "password_set": bool(NEO4J_PASSWORD),
+            "reachable": graph.ping() if hasattr(graph, "ping") else False,
+        },
+        "objects": {"root": str(OBJECT_ROOT)},
+        "models": _public_model_config(_load_model_config(seed_presets=True)),
+        "datasources": {
+            "count": len(datasources),
+            "items": [
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "type": item.type,
+                    "status": item.status,
+                    "tables": len(item.tables or []),
+                    "url_masked": item.database_url_masked,
+                }
+                for item in datasources
+            ],
+        },
+    }
+
+
 @app.get("/api/bootstrap")
 def bootstrap() -> Dict[str, Any]:
     sessions = [session for session in _sessions() if not session.deleted_at]
@@ -313,7 +437,7 @@ def bootstrap() -> Dict[str, Any]:
     dashboards = _dashboards()
     return {
         "project_id": PROJECT_ID,
-        "sessions": sessions,
+        "sessions": [{**session.model_dump(), "kind": _session_kind(session)} for session in sessions],
         "assets": assets,
         "reports": [report for report in _reports() if not report.deleted_at],
         "dashboards": dashboards,
@@ -412,6 +536,23 @@ def clone_session(session_id: str, payload: CloneSessionRequest = CloneSessionRe
     return cloned
 
 
+def _session_kind(session: Session) -> str:
+    """会话类型：report（报表生成舱会话）/ chat（对话分析会话）。
+
+    判定依据：存在由报表生成舱产出的纯图表模块报告，或标题为生成舱默认前缀。
+    """
+    if (session.title or "").startswith("纯图表报表"):
+        return "report"
+    for report in _reports():
+        if report.deleted_at or report.session_id != session.id:
+            continue
+        latest = report.versions[-1] if report.versions else None
+        modules = latest.cart_snapshot if latest else []
+        if modules and all(item.get("type") == "visual_report_module" for item in modules):
+            return "report"
+    return "chat"
+
+
 @app.get("/api/sessions")
 def list_sessions(
     project_id: str = PROJECT_ID,
@@ -428,7 +569,8 @@ def list_sessions(
         sessions = [item for item in sessions if lowered in item.title.lower() or _session_message_hit(item.id, lowered)]
     sessions.sort(key=lambda item: item.last_active_at, reverse=True)
     start = (page - 1) * page_size
-    return {"items": sessions[start : start + page_size], "total": len(sessions)}
+    items = [{**session.model_dump(), "kind": _session_kind(session)} for session in sessions[start : start + page_size]]
+    return {"items": items, "total": len(sessions)}
 
 
 @app.patch("/api/sessions/{session_id}")
@@ -733,6 +875,48 @@ def asset_library(project_id: str = PROJECT_ID) -> Dict[str, Any]:
     strategy_assets.extend(_strategy_template_summary(template) for template in _strategy_templates() if template.project_id == project_id and not template.deleted_at)
     strategy_assets.sort(key=lambda item: item["created_at"], reverse=True)
     return {"data_assets": data_assets, "strategy_assets": strategy_assets}
+
+
+def _asset_summary(asset: Asset) -> Asset:
+    """Return a lightweight Asset suitable for list views."""
+    dd = asset.data_dictionary
+    columns_count = len(dd.columns) if dd else 0
+    row_count = dd.row_count if dd else 0
+    table_name = (dd.table_name if dd else None) or asset.source_table or asset.name
+    return Asset(
+        id=asset.id,
+        project_id=asset.project_id,
+        type=asset.type,
+        name=asset.name,
+        source=asset.source,
+        object_key=asset.object_key,
+        parse_status=asset.parse_status,
+        version=asset.version,
+        datasource_id=asset.datasource_id,
+        source_table=asset.source_table,
+        tags=asset.tags,
+        data_dictionary=DataDictionary(
+            asset_id=asset.id,
+            asset_name=asset.name,
+            table_name=table_name,
+            row_count=row_count,
+            columns=[],
+            metrics=[],
+            supporting_ids=[],
+        ) if dd else None,
+        graph=KnowledgeGraph(nodes=[], edges=[]),
+        created_at=asset.created_at,
+        deleted_at=asset.deleted_at,
+    )
+
+
+@app.get("/api/assets/summary")
+def list_asset_summaries(project_id: str = PROJECT_ID) -> List[Asset]:
+    return [
+        _asset_summary(asset)
+        for asset in _assets()
+        if asset.project_id == project_id and not asset.deleted_at
+    ]
 
 
 @app.post("/api/assets/knowledge-graph")
@@ -1292,7 +1476,7 @@ def delete_asset_tag(tag_id: str) -> Dict[str, Any]:
     if children:
         raise HTTPException(status_code=400, detail=f"请先删除 {len(children)} 个子标签")
     in_use = [
-        asset.id
+        asset
         for asset in _assets()
         if not asset.deleted_at
         and any(
@@ -1300,8 +1484,18 @@ def delete_asset_tag(tag_id: str) -> Dict[str, Any]:
             for value in normalize_asset_tags(asset.tags)
         )
     ]
-    if in_use:
-        raise HTTPException(status_code=400, detail=f"标签仍被 {len(in_use)} 个数据资产使用，请先调整资产标签")
+    # 自动从关联资产上解绑该标签，避免前端必须预先处理；解绑后至少保留 public。
+    for asset in in_use:
+        next_tags = [
+            value
+            for value in normalize_asset_tags(asset.tags)
+            if value != tag.path and value != tag.name and not value.startswith(f"{tag.path}/")
+        ]
+        if not next_tags:
+            next_tags = [DEFAULT_ASSET_TAG]
+        if next_tags != asset.tags:
+            asset.tags = next_tags
+            repo.upsert("assets", asset.model_dump())
     repo.delete_soft("asset_tags", tag.id)
     repo.audit("asset_tag.delete", "asset_tag", tag.id, {"name": tag.name, "path": tag.path})
     return {"status": "deleted"}
@@ -1614,6 +1808,7 @@ def create_task(payload: CreateTaskRequest) -> Task:
     selected_templates = [_require_strategy_template(strategy_id) for strategy_id in payload.strategy_asset_ids if repo.get("strategy_templates", strategy_id)]
     selected_templates.extend(_strategy_to_template(_require_strategy(strategy_id)) for strategy_id in payload.strategy_asset_ids if repo.get("strategies", strategy_id))
     feedback_context = [_feedback_strategy_context(feedback) for feedback in _feedbacks(session_id=session.id) if feedback.rating == "up"]
+    preferred_model = (payload.preferred_model or "").strip() or None
     task = Task(
         id=new_id("task"),
         session_id=session.id,
@@ -1621,6 +1816,7 @@ def create_task(payload: CreateTaskRequest) -> Task:
         user_intent=payload.message,
         selected_assets=payload.asset_ids,
         status=TaskStatus.waiting_confirmation,
+        preferred_model=preferred_model,
     )
     user_message = Message(
         id=new_id("msg"),
@@ -1630,7 +1826,13 @@ def create_task(payload: CreateTaskRequest) -> Task:
         task_id=task.id,
     )
     get_cache().set_text(f"task:progress:{task.id}", "drafting_strategy", ttl_seconds=600)
-    strategy = _workflow().draft_strategy(
+    workflow = _workflow(
+        _model_config_for_run(
+            preferred_model=preferred_model,
+            agent_overrides=payload.agent_model_config,
+        )
+    )
+    strategy = workflow.draft_strategy(
         new_id("strategy"),
         task.id,
         payload.message,
@@ -1703,7 +1905,9 @@ def confirm_strategy(task_id: str, payload: ConfirmStrategyRequest) -> Dict[str,
     strategy.confirmed_at = now_iso()
     assets = [_require_asset(asset_id) for asset_id in task.selected_assets]
     get_cache().set_text(f"task:progress:{task.id}", "running", ttl_seconds=600)
-    result = _workflow().run_confirmed_strategy(
+    result = _workflow(
+        _model_config_for_run(preferred_model=task.preferred_model)
+    ).run_confirmed_strategy(
         execution_id=new_id("exec"),
         strategy=strategy,
         assets=assets,
@@ -1855,6 +2059,19 @@ def get_report(report_id: str) -> Dict[str, Any]:
         "version": latest,
         "items": items,
     }
+
+
+@app.patch("/api/reports/{report_id}")
+def update_report(report_id: str, payload: ReportUpdateRequest) -> Report:
+    report = _require_report(report_id)
+    if payload.title is not None:
+        title = payload.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="report title cannot be empty")
+        report.title = title
+    repo.upsert("reports", report.model_dump())
+    repo.audit("report.update", "report", report.id, {"title": report.title})
+    return report
 
 
 @app.post("/api/reports/{report_id}/strategy")
@@ -2024,15 +2241,83 @@ def delete_report(report_id: str) -> Dict[str, Any]:
 
 
 @app.get("/api/model-config")
-def get_model_config() -> ModelConfig:
-    return repo.model_config()
+def get_model_config() -> Dict[str, Any]:
+    return _public_model_config(_load_model_config(seed_presets=True))
 
 
 @app.put("/api/model-config")
-def put_model_config(payload: ModelConfig) -> ModelConfig:
-    config = repo.set_model_config(payload)
-    repo.audit("model_config.update", "model_config", "global", payload.model_dump())
-    return config
+def put_model_config(payload: ModelConfig) -> Dict[str, Any]:
+    existing = _load_model_config(seed_presets=False)
+    incoming = _normalized_model_config(payload)
+    # 全局空密钥表示保留原值；显式 "__CLEAR__" 表示清空
+    next_key = (payload.llm_api_key or "").strip()
+    if next_key == "__CLEAR__":
+        merged_key = ""
+    elif not next_key:
+        merged_key = existing.llm_api_key
+    else:
+        merged_key = next_key
+    existing_by_id = {item.id: item for item in existing.catalog}
+    merged_catalog: List[ModelCatalogEntry] = []
+    for item in incoming.catalog:
+        prev = existing_by_id.get(item.id)
+        raw_entry = next((entry for entry in (payload.catalog or []) if entry.id == item.id), None)
+        raw_key = (getattr(raw_entry, "llm_api_key", None) or "").strip() if raw_entry else ""
+        if raw_key == "__CLEAR__":
+            entry_key = ""
+        elif not raw_key:
+            entry_key = (prev.llm_api_key if prev else "") or ""
+        else:
+            entry_key = raw_key
+        merged_catalog.append(
+            ModelCatalogEntry(
+                id=item.id,
+                name=item.name,
+                provider=item.provider,
+                enabled=item.enabled,
+                description=item.description,
+                llm_base_url=(getattr(raw_entry, "llm_base_url", None) or item.llm_base_url or "").strip()
+                if raw_entry is not None
+                else item.llm_base_url,
+                llm_api_key=entry_key,
+            )
+        )
+    merged = ModelConfig(
+        global_default=incoming.global_default,
+        agents=incoming.agents,
+        params=incoming.params,
+        catalog=merged_catalog,
+        llm_base_url=(payload.llm_base_url or "").strip(),
+        llm_api_key=merged_key,
+    )
+    config = repo.set_model_config(_normalized_model_config(merged))
+    audit_payload = config.model_dump()
+    audit_payload["llm_api_key"] = "***" if config.llm_api_key else ""
+    audit_payload["catalog"] = [
+        {**item.model_dump(), "llm_api_key": "***" if item.llm_api_key else ""}
+        for item in config.catalog
+    ]
+    repo.audit("model_config.update", "model_config", "global", audit_payload)
+    return _public_model_config(config)
+
+
+@app.get("/api/models")
+def list_models(enabled_only: bool = False) -> Dict[str, Any]:
+    config = _load_model_config(seed_presets=True)
+    public = _public_model_config(config)
+    catalog = list(public.get("catalog") or [])
+    if enabled_only:
+        catalog = [item for item in catalog if item.get("enabled")]
+    return {
+        "global_default": config.global_default,
+        "agents": config.agents,
+        "params": config.params,
+        "items": catalog,
+        "llm_base_url": public.get("llm_base_url", ""),
+        "llm_api_key_set": public.get("llm_api_key_set", False),
+        "llm_api_key_hint": public.get("llm_api_key_hint", ""),
+        "llm_gateway_configured": bool(public.get("llm_gateway_configured")),
+    }
 
 
 @app.post("/api/dashboards")
@@ -2109,8 +2394,170 @@ def list_audit_logs(project_id: str = PROJECT_ID, limit: int = 100) -> List[Dict
     return sorted(logs, key=lambda item: item["created_at"], reverse=True)[:limit]
 
 
-def _workflow() -> AgentWorkflow:
-    return AgentWorkflow(router=ModelRouter(repo.model_config()), rag=get_rag_client(), sandbox=LocalSandboxExecutor())
+def _normalized_model_config(config: ModelConfig) -> ModelConfig:
+    catalog = list(config.catalog or [])
+    if not catalog:
+        catalog = default_model_catalog()
+    # 去重保序
+    seen: set[str] = set()
+    unique: List[ModelCatalogEntry] = []
+    for item in catalog:
+        model_id = (item.id or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        unique.append(
+            ModelCatalogEntry(
+                id=model_id,
+                name=(item.name or model_id).strip(),
+                provider=(item.provider or "local").strip() or "local",
+                enabled=bool(item.enabled),
+                description=(item.description or "").strip(),
+                llm_base_url=(getattr(item, "llm_base_url", None) or "").strip(),
+                llm_api_key=(getattr(item, "llm_api_key", None) or "").strip(),
+            )
+        )
+    if not unique:
+        unique = default_model_catalog()
+    default_id = (config.global_default or "").strip() or unique[0].id
+    if default_id not in {item.id for item in unique}:
+        default_id = unique[0].id
+    by_id = {item.id: item for item in unique}
+    agents = dict(config.agents or {})
+    for key in ("data", "planner", "coder", "analyzer", "report"):
+        if not (agents.get(key) or "").strip():
+            agents[key] = default_id
+    # 设为默认的外部模型应驱动策略规划与结论分析；代码生成仍可保留本地模板
+    default_entry = by_id.get(default_id)
+    if default_entry is not None and (default_entry.provider or "").strip() != "local":
+        for key in ("planner", "analyzer"):
+            current = (agents.get(key) or "").strip()
+            current_entry = by_id.get(current)
+            if not current or (current_entry is not None and (current_entry.provider or "").strip() == "local"):
+                agents[key] = default_id
+    return ModelConfig(
+        global_default=default_id,
+        agents=agents,
+        params=dict(config.params or {"temperature": 0.2}),
+        catalog=unique,
+        llm_base_url=(getattr(config, "llm_base_url", None) or "").strip(),
+        llm_api_key=(getattr(config, "llm_api_key", None) or "").strip(),
+    )
+
+
+def _seed_missing_gateway_presets(config: ModelConfig) -> Tuple[ModelConfig, bool]:
+    """One-time append of DeepSeek/OpenRouter presets for older installs.
+
+    After `params.gateway_presets_seeded` is set, user deletions are respected.
+    """
+    params = dict(config.params or {})
+    if params.get("gateway_presets_seeded"):
+        return config, False
+    seen = {item.id for item in config.catalog}
+    additions = [preset for preset in recommended_gateway_presets() if preset.id not in seen]
+    params["gateway_presets_seeded"] = True
+    return (
+        ModelConfig(
+            global_default=config.global_default,
+            agents=dict(config.agents or {}),
+            params=params,
+            catalog=[*config.catalog, *additions],
+            llm_base_url=config.llm_base_url,
+            llm_api_key=config.llm_api_key,
+        ),
+        True,
+    )
+
+
+def _load_model_config(*, seed_presets: bool = False) -> ModelConfig:
+    config = _normalized_model_config(repo.model_config())
+    if not seed_presets:
+        return config
+    seeded, changed = _seed_missing_gateway_presets(config)
+    if changed:
+        return repo.set_model_config(seeded)
+    return config
+
+
+def _public_model_config(config: ModelConfig) -> Dict[str, Any]:
+    payload = config.model_dump()
+    key = (payload.get("llm_api_key") or "").strip()
+    payload["llm_api_key"] = ""
+    payload["llm_api_key_set"] = bool(key)
+    payload["llm_api_key_hint"] = f"{'*' * 8}{key[-4:]}" if len(key) >= 4 else ("********" if key else "")
+    public_catalog = []
+    for item in config.catalog:
+        entry = item.model_dump()
+        entry_key = (entry.get("llm_api_key") or "").strip()
+        entry["llm_api_key"] = ""
+        entry["llm_api_key_set"] = bool(entry_key)
+        entry["llm_api_key_hint"] = (
+            f"{'*' * 8}{entry_key[-4:]}" if len(entry_key) >= 4 else ("********" if entry_key else "")
+        )
+        entry_base, entry_secret = resolve_llm_gateway(config, model_id=item.id)
+        entry["llm_gateway_configured"] = bool(entry_base and entry_secret)
+        public_catalog.append(entry)
+    payload["catalog"] = public_catalog
+    base_url, api_key = resolve_llm_gateway(config)
+    payload["llm_gateway_configured"] = bool(base_url and api_key)
+    return payload
+
+
+def _model_config_for_run(
+    preferred_model: Optional[str] = None,
+    agent_overrides: Optional[Dict[str, str]] = None,
+) -> ModelConfig:
+    config = _normalized_model_config(repo.model_config())
+    model_id = (preferred_model or "").strip()
+    agents = dict(config.agents)
+    if agent_overrides:
+        agents.update({str(key): str(value) for key, value in agent_overrides.items() if value})
+    if model_id:
+        enabled_ids = {item.id for item in config.catalog if item.enabled}
+        if model_id not in {item.id for item in config.catalog}:
+            # 允许临时使用未登记 id（例如自定义网关模型名）
+            config.catalog.append(
+                ModelCatalogEntry(
+                    id=model_id,
+                    name=model_id,
+                    provider="openai_compatible",
+                    enabled=True,
+                    description="任务临时指定模型",
+                )
+            )
+        elif enabled_ids and model_id not in enabled_ids:
+            raise HTTPException(status_code=400, detail=f"模型已禁用：{model_id}")
+        agents = {key: model_id for key in agents} or {
+            "data": model_id,
+            "planner": model_id,
+            "coder": model_id,
+            "analyzer": model_id,
+            "report": model_id,
+        }
+        return ModelConfig(
+            global_default=model_id,
+            agents=agents,
+            params=config.params,
+            catalog=config.catalog,
+            llm_base_url=config.llm_base_url,
+            llm_api_key=config.llm_api_key,
+        )
+    return ModelConfig(
+        global_default=config.global_default,
+        agents=agents,
+        params=config.params,
+        catalog=config.catalog,
+        llm_base_url=config.llm_base_url,
+        llm_api_key=config.llm_api_key,
+    )
+
+
+def _workflow(model_config: Optional[ModelConfig] = None) -> AgentWorkflow:
+    return AgentWorkflow(
+        router=ModelRouter(model_config or _normalized_model_config(repo.model_config())),
+        rag=get_rag_client(),
+        sandbox=LocalSandboxExecutor(),
+    )
 
 
 def _index_and_graph_asset(asset: Asset) -> None:

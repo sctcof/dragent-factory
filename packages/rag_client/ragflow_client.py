@@ -54,6 +54,12 @@ class RagFlowClient:
             body = response.read().decode("utf-8")
             return json.loads(body) if body else {}
 
+    def list_datasets(self) -> List[Dict[str, Any]]:
+        """列出 RAGFlow 账户下的知识库（用于状态探测）。"""
+        listed = self._request("GET", "/api/v1/datasets?page=1&page_size=100")
+        datasets = listed.get("data") or listed.get("datasets") or []
+        return datasets if isinstance(datasets, list) else []
+
     def ensure_kb(self, kind: str, name: str) -> str:
         if kind in self._kb_cache:
             return self._kb_cache[kind]
@@ -75,7 +81,7 @@ class RagFlowClient:
         created = self._request(
             "POST",
             "/api/v1/datasets",
-            {"name": name, "description": f"dragent {kind} knowledge base", "language": "Chinese"},
+            {"name": name, "description": f"dragent {kind} knowledge base"},
         )
         data = created.get("data") or created
         kb_id = str(data.get("id") or data.get("dataset_id") or f"local-{kind}")
@@ -145,9 +151,10 @@ class RagFlowClient:
             headers={key: value for key, value in headers.items() if value},
             method="POST",
         )
+        response_body = ""
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
-                response.read()
+                response_body = response.read().decode("utf-8")
         except HTTPError as exc:
             # Fallback: create document metadata endpoint used by some RAGFlow versions
             if exc.code in {404, 405}:
@@ -158,6 +165,33 @@ class RagFlowClient:
                 )
             else:
                 raise
+        # 新版 RAGFlow 上传后不会自动解析，需要显式触发 chunks 解析任务。
+        document_id = self._extract_document_id(response_body)
+        if document_id:
+            try:
+                self._request(
+                    "POST",
+                    f"/api/v1/datasets/{dataset_id}/chunks",
+                    {"document_ids": [document_id]},
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 旧版 RAGFlow 上传即自动解析，没有该端点，忽略即可。
+                logger.warning("RAGFlow start parsing failed (older API may auto-parse): %s", exc)
+
+    @staticmethod
+    def _extract_document_id(body: str) -> str:
+        try:
+            payload = json.loads(body or "{}")
+            data = payload.get("data") or []
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if isinstance(item, dict):
+                    document_id = item.get("id") or item.get("document_id")
+                    if document_id:
+                        return str(document_id)
+        except (ValueError, TypeError):
+            pass
+        return ""
 
     def retrieve(self, query: str, assets: List[Asset], limit: int = 8) -> List[Dict[str, Any]]:
         asset_ids = {asset.id for asset in assets}
@@ -167,6 +201,9 @@ class RagFlowClient:
                 "question": query or "数据字典",
                 "dataset_ids": [kb_id],
                 "top_k": max(1, min(limit, 20)),
+                # 0.1/0.2 会被新版 RAGFlow 视为旧参数强制升级为 0.42，这里用 0.08 保持宽松召回。
+                "similarity_threshold": 0.08,
+                "vector_similarity_weight": 0.4,
             }
             result = self._request("POST", "/api/v1/retrieval", payload)
             chunks = result.get("data", {}).get("chunks") or result.get("chunks") or []

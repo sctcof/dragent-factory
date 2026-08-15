@@ -142,7 +142,40 @@ export type StrategyAsset = {
   created_from_task_ids?: string[];
 };
 
-export type Session = { id: string; title: string; last_active_at: string; archived_at?: string | null };
+export type Session = { id: string; title: string; last_active_at: string; archived_at?: string | null; kind?: "report" | "chat" };
+export type ModelCatalogEntry = {
+  id: string;
+  name: string;
+  provider: string;
+  enabled: boolean;
+  description?: string;
+  llm_base_url?: string;
+  llm_api_key?: string;
+  llm_api_key_set?: boolean;
+  llm_api_key_hint?: string;
+  llm_gateway_configured?: boolean;
+};
+export type ModelConfig = {
+  global_default: string;
+  agents: Record<string, string>;
+  params: Record<string, unknown>;
+  catalog: ModelCatalogEntry[];
+  llm_base_url?: string;
+  llm_api_key?: string;
+  llm_api_key_set?: boolean;
+  llm_api_key_hint?: string;
+  llm_gateway_configured?: boolean;
+};
+export type ModelListResponse = {
+  global_default: string;
+  agents: Record<string, string>;
+  params: Record<string, unknown>;
+  items: ModelCatalogEntry[];
+  llm_base_url?: string;
+  llm_api_key_set?: boolean;
+  llm_api_key_hint?: string;
+  llm_gateway_configured: boolean;
+};
 export type DrTask = {
   id: string;
   session_id: string;
@@ -153,6 +186,7 @@ export type DrTask = {
   generated_code?: string;
   execution_id?: string;
   analysis_summary?: string;
+  preferred_model?: string | null;
   errors: string[];
 };
 export type Strategy = {
@@ -209,24 +243,147 @@ export type AssetDetail = {
 };
 export type Dashboard = { id: string; name: string; share_token?: string; items: Array<{ id: string; chart_config: ChartConfig; query_binding_id?: string }> };
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: init?.body instanceof FormData ? init.headers : { "Content-Type": "application/json", ...(init?.headers || {}) },
-    cache: "no-store"
-  });
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(detail || response.statusText);
+export type OpenApiSchema = {
+  $ref?: string;
+  type?: string;
+  title?: string;
+  description?: string;
+  format?: string;
+  enum?: unknown[];
+  properties?: Record<string, OpenApiSchema>;
+  items?: OpenApiSchema;
+  required?: string[];
+  allOf?: OpenApiSchema[];
+  anyOf?: OpenApiSchema[];
+  oneOf?: OpenApiSchema[];
+  additionalProperties?: boolean | OpenApiSchema;
+};
+
+export type OpenApiParameter = {
+  name: string;
+  in: "query" | "path" | "header" | "cookie";
+  required?: boolean;
+  description?: string;
+  schema?: OpenApiSchema;
+};
+
+export type OpenApiOperation = {
+  operationId?: string;
+  summary?: string;
+  description?: string;
+  deprecated?: boolean;
+  parameters?: OpenApiParameter[];
+  requestBody?: {
+    required?: boolean;
+    content?: Record<string, { schema?: OpenApiSchema }>;
+  };
+  responses?: Record<string, { description?: string; content?: Record<string, { schema?: OpenApiSchema }> }>;
+};
+
+export type OpenApiSpec = {
+  openapi: string;
+  info: { title: string; version: string; description?: string };
+  paths: Record<string, Record<string, OpenApiOperation>>;
+  components?: { schemas?: Record<string, OpenApiSchema> };
+};
+
+export type HealthResponse = {
+  status: string;
+  project_id: string;
+  time: string;
+  stack: {
+    store: string;
+    store_ok: boolean;
+    vector_backend: string;
+    redis: boolean;
+    neo4j: boolean;
+  };
+};
+
+export type SystemConfigResponse = {
+  app: { title: string; version: string };
+  project_id: string;
+  time: string;
+  storage: {
+    mode: string;
+    ok: boolean;
+    metadata_path: string;
+    database_url: string;
+  };
+  vector: {
+    backend: string;
+    ragflow: {
+      configured: boolean;
+      base_url: string;
+      api_key_set: boolean;
+      reachable?: boolean | null;
+      kb_count?: number;
+      kb?: { id: string; name: string; docs: number; chunks: number; embedding_model: string };
+      error?: string;
+    };
+  };
+  cache: {
+    redis_url: string;
+    reachable: boolean;
+  };
+  graph: {
+    neo4j_uri: string;
+    neo4j_user: string;
+    password_set: boolean;
+    reachable: boolean;
+  };
+  objects: { root: string };
+  models: ModelConfig;
+  datasources: {
+    count: number;
+    items: Array<{ id: string; name: string; type: string; status: string; tables: number; url_masked: string }>;
+  };
+};
+
+type RequestOptions = RequestInit & { timeoutMs?: number };
+
+async function request<T>(path: string, init?: RequestOptions): Promise<T> {
+  const controller = new AbortController();
+  const timeoutMs = init?.timeoutMs ?? 30000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  if (init?.signal) {
+    if (init.signal.aborted) controller.abort();
+    else init.signal.addEventListener("abort", () => controller.abort(), { once: true });
   }
-  return response.json() as Promise<T>;
+  try {
+    const { timeoutMs: _ignored, ...fetchInit } = init || {};
+    const response = await fetch(`${API_BASE}${path}`, {
+      ...fetchInit,
+      signal: controller.signal,
+      headers: fetchInit.body instanceof FormData
+        ? fetchInit.headers
+        : { "Content-Type": "application/json", ...(fetchInit.headers || {}) },
+      cache: "no-store"
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(detail || response.statusText);
+    }
+    return response.json() as Promise<T>;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}s），请确认 API 服务是否正常后重试`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export const api = {
   base: API_BASE,
-  bootstrap: () => request<{ project_id: string; sessions: Session[]; assets: Asset[]; reports: { items?: Report[] } | Report[]; dashboards: Dashboard[]; datasources?: Datasource[]; model_config: Record<string, unknown> }>("/api/bootstrap"),
+  openapi: () => request<OpenApiSpec>("/openapi.json"),
+  health: () => request<HealthResponse>("/api/health"),
+  systemConfig: () => request<SystemConfigResponse>("/api/system-config"),
+  bootstrap: () => request<{ project_id: string; sessions: Session[]; assets: Asset[]; reports: { items?: Report[] } | Report[]; dashboards: Dashboard[]; datasources?: Datasource[]; model_config: Record<string, unknown> }>("/api/bootstrap", { timeoutMs: 60000 }),
   listSessions: (status = "active") => request<{ items: Session[]; total: number }>(`/api/sessions?status=${encodeURIComponent(status)}&page_size=100`),
   assetLibrary: () => request<{ data_assets: Asset[]; strategy_assets: StrategyAsset[] }>("/api/asset-library"),
+  listAssetSummaries: () => request<Asset[]>("/api/assets/summary"),
   supportedDatasources: () =>
     request<{ supported: Record<string, string>; kinds?: string[]; labels?: Record<string, string> }>("/api/datasources/supported"),
   datasources: () => request<Datasource[]>("/api/datasources"),
@@ -270,6 +427,7 @@ export const api = {
     }>("/api/assets/analysis-questions", {
       method: "POST",
       body: JSON.stringify({ goal, asset_ids, count }),
+      timeoutMs: 120000,
     }),
   updateAssetTags: (assetId: string, tags: string[]) =>
     request<Asset>(`/api/assets/${assetId}/tags`, { method: "PATCH", body: JSON.stringify({ tags }) }),
@@ -300,10 +458,29 @@ export const api = {
     form.append("file", file);
     return request<Asset>("/api/assets/upload", { method: "POST", body: form });
   },
-  createTask: (session_id: string, message: string, asset_ids: string[]) =>
-    request<DrTask>("/api/tasks", { method: "POST", body: JSON.stringify({ session_id, message, asset_ids }) }),
-  createTaskWithStrategies: (session_id: string, message: string, asset_ids: string[], strategy_asset_ids: string[]) =>
-    request<DrTask>("/api/tasks", { method: "POST", body: JSON.stringify({ session_id, message, asset_ids, strategy_asset_ids }) }),
+  listModels: (enabled_only = false) =>
+    request<ModelListResponse>(`/api/models?enabled_only=${enabled_only ? "true" : "false"}`),
+  getModelConfig: () => request<ModelConfig>("/api/model-config"),
+  putModelConfig: (payload: ModelConfig) =>
+    request<ModelConfig>("/api/model-config", { method: "PUT", body: JSON.stringify(payload) }),
+  createTask: (session_id: string, message: string, asset_ids: string[], preferred_model?: string) =>
+    request<DrTask>("/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ session_id, message, asset_ids, preferred_model }),
+      timeoutMs: 120000,
+    }),
+  createTaskWithStrategies: (
+    session_id: string,
+    message: string,
+    asset_ids: string[],
+    strategy_asset_ids: string[],
+    preferred_model?: string
+  ) =>
+    request<DrTask>("/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ session_id, message, asset_ids, strategy_asset_ids, preferred_model }),
+      timeoutMs: 120000,
+    }),
   getTask: (taskId: string) => request<ApiTaskBundle>(`/api/tasks/${taskId}`),
   ragContext: (query: string, asset_ids: string[], limit = 8) =>
     request<{ items: RagContextItem[] }>("/api/rag/context", { method: "POST", body: JSON.stringify({ query, asset_ids, limit }) }),
@@ -322,10 +499,16 @@ export const api = {
   confirmStrategy: (taskId: string, strategy: Strategy) =>
     request<ApiTaskBundle>(`/api/tasks/${taskId}/strategy/confirm`, {
       method: "POST",
-      body: JSON.stringify({ strategy_id: strategy.id, confirmed_strategy: strategy })
+      body: JSON.stringify({ strategy_id: strategy.id, confirmed_strategy: strategy }),
+      // 确认后会同步生成代码、执行沙箱、调用模型总结，DeepSeek 场景常超过 30s
+      timeoutMs: 300000,
     }),
   rerunCode: (task_id: string, code: string, asset_ids: string[]) =>
-    request<ExecutionResult>("/api/executions", { method: "POST", body: JSON.stringify({ task_id, code, asset_ids, language: "python" }) }),
+    request<ExecutionResult>("/api/executions", {
+      method: "POST",
+      body: JSON.stringify({ task_id, code, asset_ids, language: "python" }),
+      timeoutMs: 180000,
+    }),
   addCart: (payload: { session_id: string; type: string; ref_id: string; title: string; snapshot: Record<string, unknown> }) =>
     request<CartItem>("/api/cart-items", { method: "POST", body: JSON.stringify(payload) }),
   cartItems: (sessionId: string) => request<CartItem[]>(`/api/cart-items?session_id=${sessionId}`),
@@ -333,6 +516,8 @@ export const api = {
     request<Report>("/api/reports", { method: "POST", body: JSON.stringify({ session_id, cart_item_ids, title }) }),
   listReports: () => request<{ items: Report[]; total: number }>("/api/reports"),
   reportDetail: (reportId: string) => request<ReportDetail>(`/api/reports/${reportId}`),
+  updateReport: (reportId: string, payload: { title: string }) =>
+    request<Report>(`/api/reports/${reportId}`, { method: "PATCH", body: JSON.stringify(payload) }),
   runReportModule: (reportId: string, moduleId: string, params: Record<string, unknown> = {}) =>
     request<ReportDetail>(`/api/reports/${reportId}/items/${moduleId}/run`, { method: "POST", body: JSON.stringify({ params }) }),
   deleteReportModule: (reportId: string, moduleId: string) =>

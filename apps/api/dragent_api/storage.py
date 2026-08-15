@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
@@ -110,6 +112,10 @@ class JsonRepository:
     def __init__(self, db_path: Path = DB_PATH) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._cache: Optional[Dict[str, Any]] = None
+        self._mtime: float = 0.0
+        # 单进程内串行化“读-改-写”，避免 FastAPI 线程池并发写坏 JSON 文件。
+        self._lock = threading.RLock()
         if not self.db_path.exists():
             self._write(self._empty())
 
@@ -119,21 +125,35 @@ class JsonRepository:
         return data
 
     def _read(self) -> Dict[str, Any]:
-        data = json.loads(self.db_path.read_text(encoding="utf-8"))
-        changed = False
-        for collection in COLLECTIONS:
-            if collection not in data:
-                data[collection] = {}
+        with self._lock:
+            try:
+                mtime = self.db_path.stat().st_mtime
+            except FileNotFoundError:
+                mtime = 0.0
+            if self._cache is not None and mtime == self._mtime:
+                return self._cache
+            data = json.loads(self.db_path.read_text(encoding="utf-8"))
+            changed = False
+            for collection in COLLECTIONS:
+                if collection not in data:
+                    data[collection] = {}
+                    changed = True
+            if "model_config" not in data:
+                data["model_config"] = ModelConfig().model_dump()
                 changed = True
-        if "model_config" not in data:
-            data["model_config"] = ModelConfig().model_dump()
-            changed = True
-        if changed:
-            self._write(data)
-        return data
+            if changed:
+                self._write(data)
+            self._cache = data
+            self._mtime = mtime
+            return data
 
     def _write(self, data: Dict[str, Any]) -> None:
-        self.db_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            # 先写临时文件再原子替换，避免并发写入产生半截/交错内容。
+            tmp_path = self.db_path.with_name(f".{self.db_path.name}.tmp")
+            tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp_path, self.db_path)
+            self._cache = None
 
     def all(self, collection: str) -> List[Dict[str, Any]]:
         data = self._read()
@@ -143,26 +163,29 @@ class JsonRepository:
         return self._read()[collection].get(item_id)
 
     def upsert(self, collection: str, item: Dict[str, Any]) -> Dict[str, Any]:
-        data = self._read()
-        key = PRIMARY_KEYS.get(collection, "id")
-        data[collection][item[key]] = item
-        self._write(data)
-        return item
+        with self._lock:
+            data = self._read()
+            key = PRIMARY_KEYS.get(collection, "id")
+            data[collection][item[key]] = item
+            self._write(data)
+            return item
 
     def delete_soft(self, collection: str, item_id: str) -> None:
-        data = self._read()
-        if item_id in data[collection]:
-            data[collection][item_id]["deleted_at"] = now_iso()
-            self._write(data)
+        with self._lock:
+            data = self._read()
+            if item_id in data[collection]:
+                data[collection][item_id]["deleted_at"] = now_iso()
+                self._write(data)
 
     def model_config(self) -> ModelConfig:
         return ModelConfig(**self._read().get("model_config", {}))
 
     def set_model_config(self, config: ModelConfig) -> ModelConfig:
-        data = self._read()
-        data["model_config"] = config.model_dump()
-        self._write(data)
-        return config
+        with self._lock:
+            data = self._read()
+            data["model_config"] = config.model_dump()
+            self._write(data)
+            return config
 
     def audit(self, action: str, target_type: str, target_id: str, detail: Dict[str, Any]) -> None:
         log = AuditLog(

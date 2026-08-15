@@ -4,13 +4,22 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   BarChart3,
   Bot,
+  ChartArea,
+  ChartCandlestick,
+  ChartColumnStacked,
+  ChartNoAxesCombined,
+  ChartScatter,
   Check,
   ChevronDown,
   ChevronRight,
   ChevronUp,
+  CircleGauge,
+  CircleHelp,
   Code2,
   Copy,
   Database,
+  Eye,
+  EyeOff,
   FilePlus2,
   FileText,
   FolderKanban,
@@ -26,13 +35,15 @@ import {
   Play,
   RefreshCw,
   Send,
+  Server,
   Sparkles,
   ShoppingCart,
   Table2,
   ThumbsDown,
   ThumbsUp,
   Trash2,
-  X
+  X,
+  type LucideIcon
 } from "lucide-react";
 import {
   api,
@@ -43,6 +54,7 @@ import {
   type Dashboard,
   type Dataset,
   type ExecutionResult,
+  type ModelCatalogEntry,
   type Report,
   type RagContextItem,
   type Session,
@@ -93,12 +105,120 @@ function matchDatasetIds(datasets: Dataset[], assetIds: string[]): string[] {
     .map((item) => item.id);
 }
 
-const CHART_TYPE_OPTIONS = [
-  { type: "line", label: "曲线图", icon: LineChart },
-  { type: "bar", label: "柱状图", icon: BarChart3 },
-  { type: "pie", label: "饼图", icon: PieChart },
-  { type: "heatmap", label: "热力图", icon: Grid3X3 },
+type ChartTypeOption = {
+  type: string;
+  label: string;
+  description: string;
+  icon: LucideIcon;
+};
+
+const COMMON_CHART_TYPE_OPTIONS: ChartTypeOption[] = [
+  { type: "line", label: "曲线图", description: "观察连续趋势和时间序列变化", icon: LineChart },
+  { type: "bar", label: "柱状图", description: "对比分类或分组指标高低", icon: BarChart3 },
+  { type: "pie", label: "饼图", description: "查看构成占比和贡献结构", icon: PieChart },
+  { type: "heatmap", label: "热力图", description: "观察维度交叉下的强弱分布", icon: Grid3X3 },
 ];
+
+const MORE_CHART_TYPE_OPTIONS: ChartTypeOption[] = [
+  { type: "area", label: "面积图", description: "突出趋势累计体量和波动区间", icon: ChartArea },
+  { type: "scatter", label: "散点图", description: "观察分布、离群点和相关关系", icon: ChartScatter },
+  { type: "stacked_bar", label: "堆叠柱状图", description: "同时比较总量和内部构成", icon: ChartColumnStacked },
+  { type: "horizontal_bar", label: "横向条形图", description: "适合长分类名称和排名对比", icon: BarChart3 },
+  { type: "radar", label: "雷达图", description: "比较多个指标轮廓和综合能力", icon: ChartNoAxesCombined },
+  { type: "gauge", label: "仪表盘", description: "展示单个关键指标完成度", icon: CircleGauge },
+  { type: "metric", label: "指标卡", description: "单值高亮，适合仅 1 个分组或 KPI", icon: CircleGauge },
+  { type: "funnel", label: "漏斗图", description: "展示转化、流失和阶段递进", icon: ChartCandlestick },
+  { type: "treemap", label: "矩形树图", description: "展示多类别规模占比和层次感", icon: LayoutDashboard },
+  { type: "doughnut", label: "环形图", description: "更适合卡片内展示占比结构", icon: PieChart },
+  { type: "rose", label: "玫瑰图", description: "突出占比差异和结构视觉层次", icon: PieChart },
+  { type: "table", label: "数据表", description: "查看原始明细和分组结果", icon: Table2 },
+];
+
+const CHART_TYPE_OPTIONS = [...COMMON_CHART_TYPE_OPTIONS, ...MORE_CHART_TYPE_OPTIONS];
+
+function ChartTypeSelector({
+  selectedType,
+  disabled,
+  compact,
+  onSelect
+}: {
+  selectedType: string;
+  disabled?: boolean;
+  compact?: boolean;
+  onSelect: (type: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement | null>(null);
+  const selectedOption = CHART_TYPE_OPTIONS.find((item) => item.type === selectedType);
+  const selectedInMore = MORE_CHART_TYPE_OPTIONS.some((item) => item.type === selectedType);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    window.addEventListener("mousedown", onPointerDown);
+    return () => window.removeEventListener("mousedown", onPointerDown);
+  }, [open]);
+
+  return (
+    <div ref={pickerRef} className={`visualizationPicker ${compact ? "compact" : ""}`}>
+      {COMMON_CHART_TYPE_OPTIONS.map((option) => {
+        const Icon = option.icon;
+        return (
+          <button
+            key={option.type}
+            className={selectedType === option.type ? "active" : ""}
+            disabled={disabled}
+            title={`${option.label}：${option.description}`}
+            onClick={() => onSelect(option.type)}
+          >
+            <Icon size={compact ? 14 : 15} /> <span>{option.label}</span>
+          </button>
+        );
+      })}
+      <button
+        className={`moreVisualizationButton ${selectedInMore ? "active" : ""}`}
+        disabled={disabled}
+        title={selectedOption ? `当前：${selectedOption.label}` : "选择更多可视化图表"}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <ChartNoAxesCombined size={compact ? 14 : 15} />
+        <span>{compact ? "更多" : "更多可视化"}</span>
+        <ChevronDown size={13} />
+      </button>
+      {open ? (
+        <div className="visualizationMenu">
+          <div className="visualizationMenuHeader">
+            <strong>更多可视化</strong>
+            <span>{selectedOption?.label || "选择图表"}</span>
+          </div>
+          <div className="visualizationMenuGrid">
+            {MORE_CHART_TYPE_OPTIONS.map((option) => {
+              const Icon = option.icon;
+              return (
+                <button
+                  key={option.type}
+                  className={selectedType === option.type ? "active" : ""}
+                  onClick={() => {
+                    onSelect(option.type);
+                    setOpen(false);
+                  }}
+                >
+                  <Icon size={16} />
+                  <span>
+                    <strong>{option.label}</strong>
+                    <em>{option.description}</em>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 export default function WorkspacePage() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -136,6 +256,8 @@ export default function WorkspacePage() {
   const [suggestBusy, setSuggestBusy] = useState(false);
   const [strategyPreview, setStrategyPreview] = useState<StrategyAsset | null>(null);
   const [ragContext, setRagContext] = useState<RagContextItem[]>([]);
+  const [availableModels, setAvailableModels] = useState<ModelCatalogEntry[]>([]);
+  const [selectedModelId, setSelectedModelId] = useState("local-heuristic");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("准备就绪");
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -205,11 +327,68 @@ export default function WorkspacePage() {
     setAssets(data.assets || []);
     setReports(Array.isArray(data.reports) ? data.reports : data.reports.items || []);
     setDashboards(data.dashboards || []);
-    const [library, datasetList] = await Promise.all([api.assetLibrary(), api.listDatasets()]);
+    const [library, datasetList, modelList] = await Promise.all([
+      api.assetLibrary(),
+      api.listDatasets(),
+      api.listModels(false).catch(() => ({
+        global_default: "local-heuristic",
+        agents: {},
+        params: {},
+        items: [
+          {
+            id: "local-heuristic",
+            name: "本地启发式",
+            provider: "local",
+            enabled: true,
+            description: "无外部依赖，确定性规则分析",
+          },
+          {
+            id: "gpt-4o-mini",
+            name: "GPT-4o mini",
+            provider: "openai_compatible",
+            enabled: true,
+            description: "需配置 LLM_BASE_URL / LLM_API_KEY",
+          },
+        ],
+        llm_gateway_configured: false,
+      })),
+    ]);
     setAssets(library.data_assets);
     setStrategyAssets(library.strategy_assets);
     setDatasets(datasetList);
-    const nextSession = data.sessions.find((item) => item.id === preferredSessionId) || activeSession || data.sessions?.[0] || null;
+    const modelItems = modelList.items?.length
+      ? modelList.items
+      : [
+          {
+            id: "local-heuristic",
+            name: "本地启发式",
+            provider: "local",
+            enabled: true,
+            description: "无外部依赖，确定性规则分析",
+          },
+        ];
+    setAvailableModels(modelItems);
+    const storedModel =
+      typeof window !== "undefined" ? window.localStorage.getItem("dragent.selected_model") || "" : "";
+    const enabledIds = new Set(modelItems.filter((item) => item.enabled).map((item) => item.id));
+    const nextModel =
+      (storedModel && enabledIds.has(storedModel) && storedModel) ||
+      (enabledIds.has(modelList.global_default) && modelList.global_default) ||
+      modelItems.find((item) => item.enabled)?.id ||
+      "local-heuristic";
+    setSelectedModelId(nextModel);
+    const requested = preferredSessionId
+      ? data.sessions.find((item) => item.id === preferredSessionId) || null
+      : null;
+    if (requested && requested.kind === "report") {
+      // 明确指向报表型会话时，重定向到报表生成舱。
+      window.location.href = `/report-studio?session_id=${requested.id}`;
+      return;
+    }
+    const chatFallback = activeSession && activeSession.kind !== "report"
+      ? activeSession
+      : data.sessions.find((item) => item.kind !== "report") || null;
+    const nextSession = requested || chatFallback;
     if (nextSession) {
       await openSession(nextSession, preferredDatasetIds, preferredAssetIds, preferredPrompt, datasetList);
     } else if (preferredDatasetIds.length) {
@@ -226,6 +405,11 @@ export default function WorkspacePage() {
     preferredPrompt = "",
     datasetSource: Dataset[] = datasets
   ) {
+    // 报表型会话跳转到报表生成舱，而不是在对话界面打开。
+    if (session.kind === "report") {
+      window.location.href = `/report-studio?session_id=${session.id}`;
+      return;
+    }
     setActiveSession(session);
     setTitleDraft(session.title);
     setEditingTitle(false);
@@ -448,7 +632,13 @@ export default function WorkspacePage() {
     }
     try {
       const strategyRefs = preferNewStrategy ? [] : selectedStrategyAssets;
-      const task = await api.createTaskWithStrategies(session.id, text, taskAssetIds, strategyRefs);
+      const task = await api.createTaskWithStrategies(
+        session.id,
+        text,
+        taskAssetIds,
+        strategyRefs,
+        selectedModelId || undefined
+      );
       const bundle = await api.getTask(task.id);
       setTimeline((items) => [
         ...items,
@@ -681,7 +871,7 @@ export default function WorkspacePage() {
     const draft = strategyDrafts[bundle.task.id] || bundle.strategy;
     if (!draft || busy) return;
     setBusy(true);
-    setNotice("策略已确认，正在生成代码、执行并返回图表");
+    setNotice("策略已确认，正在生成代码并执行（调用 DeepSeek 时可能需要 1–3 分钟，请勿关闭页面）");
     let nextPlanText: string | null = null;
     try {
       const nextBundle = await api.confirmStrategy(bundle.task.id, draft);
@@ -859,6 +1049,9 @@ export default function WorkspacePage() {
             <button className="railMiniButton primaryMiniButton" title="新会话" aria-label="新会话" onClick={newSession}>
               <FilePlus2 size={20} />
             </button>
+            <a className="railMiniButton" href="/report-studio" title="新增报表" aria-label="新增报表">
+              <FileText size={20} />
+            </a>
             <a className="railMiniButton" href="/sessions" title="会话列表" aria-label="会话列表">
               <FileText size={20} />
             </a>
@@ -867,6 +1060,15 @@ export default function WorkspacePage() {
             </a>
             <a className="railMiniButton" href="/strategies" title="策略资产" aria-label="策略资产">
               <GitBranch size={20} />
+            </a>
+            <a className="railMiniButton" href="/models" title="模型管理" aria-label="模型管理">
+              <Sparkles size={20} />
+            </a>
+            <a className="railMiniButton" href="/help" title="接口帮助" aria-label="接口帮助">
+              <CircleHelp size={20} />
+            </a>
+            <a className="railMiniButton" href="/system" title="系统配置" aria-label="系统配置">
+              <Server size={20} />
             </a>
           </div>
         ) : (
@@ -887,6 +1089,9 @@ export default function WorkspacePage() {
             <button className="primaryButton" onClick={newSession}>
               <FilePlus2 size={16} /> 新会话
             </button>
+            <a className="primaryButton reportRailButton" href="/report-studio">
+              <FileText size={16} /> 新增报表
+            </a>
 
             <section className="railSection">
               <h2>会话</h2>
@@ -894,7 +1099,7 @@ export default function WorkspacePage() {
                 {latestSessions.map((session) => (
                   <button key={session.id} className={session.id === activeSession?.id ? "railItem active" : "railItem"} onClick={() => openSession(session)}>
                     <span>{session.title}</span>
-                    <small>{session.last_active_at.slice(0, 10)}</small>
+                    <small>{session.kind === "report" ? "报表 · " : ""}{session.last_active_at.slice(0, 10)}</small>
                   </button>
                 ))}
                 <a className="railMore" href="/sessions">更多会话</a>
@@ -956,6 +1161,56 @@ export default function WorkspacePage() {
                 ))}
                 <a className="railMore" href="/strategies">更多策略资产</a>
               </div> : null}
+            </section>
+
+            <section className="railSection railModelsSection" aria-label="可用大模型">
+              <div className="railSectionHeadingRow">
+                <h2>可用大模型</h2>
+                <a className="railMoreInline" href="/models">模型管理</a>
+              </div>
+              <div className="railList">
+                {(availableModels.filter((model) => model.enabled).length
+                  ? availableModels.filter((model) => model.enabled)
+                  : [
+                      {
+                        id: "local-heuristic",
+                        name: "本地启发式",
+                        provider: "local",
+                        enabled: true,
+                        description: "默认本地模型",
+                      },
+                    ]
+                )
+                  .slice(0, 4)
+                  .map((model) => (
+                    <button
+                      key={model.id}
+                      type="button"
+                      className={model.id === selectedModelId ? "railItem active" : "railItem"}
+                      title={model.description || model.id}
+                      onClick={() => {
+                        setSelectedModelId(model.id);
+                        if (typeof window !== "undefined") {
+                          window.localStorage.setItem("dragent.selected_model", model.id);
+                        }
+                        setNotice(`已选择模型：${model.name}`);
+                      }}
+                    >
+                      <span>{model.name}</span>
+                      <small>{model.provider}</small>
+                    </button>
+                  ))}
+                <a className="railMore" href="/models">更多模型</a>
+              </div>
+            </section>
+
+            <section className="railSection railHelpSection">
+              <a className="railMoreInline" href="/help" title="查看全部后端接口文档">
+                <CircleHelp size={14} /> 接口帮助
+              </a>
+              <a className="railMoreInline" href="/system" title="查看基础服务配置信息">
+                <Server size={14} /> 系统配置
+              </a>
             </section>
           </>
         )}
@@ -1129,6 +1384,16 @@ export default function WorkspacePage() {
                   useNewStrategy={useNewStrategy}
                   onUseNewStrategyChange={setUseNewStrategy}
                   onOpen={() => setStrategyPickerOpen(true)}
+                  models={availableModels.filter((model) => model.enabled)}
+                  selectedModelId={selectedModelId}
+                  onModelChange={(modelId) => {
+                    setSelectedModelId(modelId);
+                    if (typeof window !== "undefined") {
+                      window.localStorage.setItem("dragent.selected_model", modelId);
+                    }
+                    const model = availableModels.find((item) => item.id === modelId);
+                    setNotice(`已选择模型：${model?.name || modelId}`);
+                  }}
                 />
                 <div className="composerAssistRow">
                   <RagContextStrip items={ragContext} assets={assets} />
@@ -1468,6 +1733,13 @@ function StrategyCard({
         <div className="strategyCollapsedSummary">
           <p>{strategy.objective}</p>
           <div className="strategyChips">
+            <span>
+              {strategy.assumptions?.[0]?.startsWith("策略来源：外部模型")
+                ? "模型策略"
+                : strategy.assumptions?.[0]?.startsWith("策略来源：")
+                  ? "本地策略"
+                  : "策略"}
+            </span>
             <span>维度：{strategy.dimensions.join(", ") || "-"}</span>
             <span>指标：{strategy.metrics.join(", ") || "-"}</span>
             <span>图表：{selectedChartLabel}</span>
@@ -1514,21 +1786,11 @@ function StrategyCard({
             </label>
           </div>
           <CollapsibleBlock title="回答图表形式" summary={selectedChartLabel} defaultOpen={!confirmed}>
-            <div className="chartTypePicker">
-              {CHART_TYPE_OPTIONS.map((option) => {
-                const Icon = option.icon;
-                return (
-                  <button
-                    key={option.type}
-                    className={selectedChartType === option.type ? "active" : ""}
-                    disabled={readOnly || confirmed}
-                    onClick={() => updateChartType(option.type)}
-                  >
-                    <Icon size={15} /> {option.label}
-                  </button>
-                );
-              })}
-            </div>
+            <ChartTypeSelector
+              selectedType={selectedChartType}
+              disabled={readOnly || confirmed}
+              onSelect={updateChartType}
+            />
           </CollapsibleBlock>
           <CollapsibleBlock title="分析流程" summary={`${strategy.methods.length} 个步骤`} defaultOpen={false}>
             <div className="strategyFlowPanel nested">
@@ -1542,6 +1804,43 @@ function StrategyCard({
       )}
     </section>
   );
+}
+
+/** 对比/汇总类图若只有 1 个分组，自动改为指标卡，避免单柱难看 */
+function normalizeChartForDisplay(chart: ChartConfig): ChartConfig {
+  const compareTypes = new Set([
+    "bar",
+    "line",
+    "area",
+    "pie",
+    "doughnut",
+    "rose",
+    "heatmap",
+    "horizontal_bar",
+    "stacked_bar",
+    "funnel",
+    "treemap",
+    "radar",
+  ]);
+  const rows = chart.dataset || [];
+  if (!compareTypes.has(chart.type) || rows.length >= 2) return chart;
+  if (rows.length === 0) return chart;
+  const yField = chart.y_fields?.[0];
+  const row = rows[0] || {};
+  const value = yField != null ? row[yField] : Object.values(row).find((item) => typeof item === "number") ?? Object.values(row)[0];
+  const labelKey = chart.x_field && row[chart.x_field] != null ? String(row[chart.x_field]) : "";
+  return {
+    ...chart,
+    type: "metric",
+    title: labelKey
+      ? `${labelKey} · ${yField || "指标"}`
+      : chart.title.replace(/对比|汇总/g, "概况"),
+    dataset: [{ value: value as string | number }],
+    y_fields: ["value"],
+    insight:
+      chart.insight?.trim() ||
+      "当前仅 1 个分组，已切换为指标卡；对比类图表需至少 2 个维度/分组。",
+  };
 }
 
 function parseAnalysisSummary(summary: string): { paragraphs: string[]; findings: string[] } {
@@ -1603,10 +1902,23 @@ function ResultCard({
   onPinChart: (chart: ChartConfig) => void;
 }) {
   const [chartTypes, setChartTypes] = useState<Record<string, string>>({});
+  const [hiddenChartIds, setHiddenChartIds] = useState<string[]>([]);
   const [detailChartId, setDetailChartId] = useState<string | null>(null);
   const displayCharts = useMemo(
-    () => charts.map((chart) => ({ ...chart, type: chartTypes[chart.id] || chart.type })),
-    [charts, chartTypes]
+    () =>
+      charts
+        .filter((chart) => !hiddenChartIds.includes(chart.id))
+        .map((chart) => {
+          const override = chartTypes[chart.id] as ChartConfig["type"] | undefined;
+          const next = { ...chart, type: override || chart.type };
+          // 用户手动选过图表类型时尊重选择；否则单分组自动改指标卡
+          return override ? next : normalizeChartForDisplay(next);
+        }),
+    [charts, chartTypes, hiddenChartIds]
+  );
+  const hiddenCharts = useMemo(
+    () => charts.filter((chart) => hiddenChartIds.includes(chart.id)),
+    [charts, hiddenChartIds]
   );
   const detailChart = displayCharts.find((chart) => chart.id === detailChartId);
   const processSteps = execution.process_steps || [];
@@ -1665,35 +1977,63 @@ function ResultCard({
           </button>
         </div>
       ) : null}
+      {hiddenCharts.length ? (
+        <div className="chartHiddenBar">
+          <span>已隐藏 {hiddenCharts.length} 张图</span>
+          {hiddenCharts.map((chart) => (
+            <button
+              key={chart.id}
+              type="button"
+              title={`重新显示：${chart.title}`}
+              onClick={() => setHiddenChartIds((ids) => ids.filter((id) => id !== chart.id))}
+            >
+              <Eye size={14} /> {chart.title}
+            </button>
+          ))}
+        </div>
+      ) : null}
       <div className="chartGrid">
-        {displayCharts.map((chart) => (
+        {displayCharts.map((chart) => {
+          const rawChart = charts.find((item) => item.id === chart.id) || chart;
+          const categoryCount = (rawChart.dataset || []).length;
+          const autoMetric =
+            chart.type === "metric" &&
+            categoryCount > 0 &&
+            categoryCount < 2 &&
+            !chartTypes[chart.id];
+          return (
           <div className="chartWithActions" key={chart.id}>
             <div className="chartToolbar" aria-label="图表样式切换">
-              {CHART_TYPE_OPTIONS.map((option) => {
-                const Icon = option.icon;
-                const active = chart.type === option.type;
-                return (
-                  <button
-                    key={option.type}
-                    className={active ? "active" : ""}
-                    title={`切换为${option.label}`}
-                    onClick={() => setChartTypes((items) => ({ ...items, [chart.id]: option.type }))}
-                  >
-                    <Icon size={14} />
-                    <span>{option.label}</span>
-                  </button>
-                );
-              })}
+              <ChartTypeSelector
+                compact
+                selectedType={chartTypes[chart.id] || chart.type}
+                onSelect={(type) => setChartTypes((items) => ({ ...items, [chart.id]: type }))}
+              />
+              <button
+                type="button"
+                className="chartHideButton"
+                title="隐藏此图"
+                onClick={() => {
+                  setHiddenChartIds((ids) => (ids.includes(chart.id) ? ids : [...ids, chart.id]));
+                  if (detailChartId === chart.id) setDetailChartId(null);
+                }}
+              >
+                <EyeOff size={14} /> 隐藏
+              </button>
             </div>
+            {autoMetric ? (
+              <p className="chartAutoNote">仅 1 个分组，已自动改为指标卡（可在上方切换其它图表类型）</p>
+            ) : null}
             <ChartPanel chart={chart} />
             <div className="chartActionRow">
               <button onClick={() => setDetailChartId((current) => current === chart.id ? null : chart.id)}>
                 <Table2 size={15} /> {detailChartId === chart.id ? "收起详情" : "详情"}
               </button>
-              <button disabled={readOnly} onClick={() => onPinChart(chart)}><LayoutDashboard size={15} /> 钉到看板</button>
+              <button disabled={readOnly} onClick={() => onPinChart(rawChart)}><LayoutDashboard size={15} /> 钉到看板</button>
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
       {detailChart ? (
         <div className="resultDetailPanel">
@@ -1780,11 +2120,17 @@ function StrategyStrip({
   useNewStrategy,
   onUseNewStrategyChange,
   onOpen,
+  models,
+  selectedModelId,
+  onModelChange,
 }: {
   strategies: StrategyAsset[];
   useNewStrategy: boolean;
   onUseNewStrategyChange: (value: boolean) => void;
   onOpen: () => void;
+  models: ModelCatalogEntry[];
+  selectedModelId: string;
+  onModelChange: (modelId: string) => void;
 }) {
   return (
     <div className="strategyStrip">
@@ -1807,6 +2153,26 @@ function StrategyStrip({
       ) : (
         <small>未选策略资产，将自动匹配并直接分析</small>
       )}
+      <label className="composerModelSelect" title="选择本轮分析使用的大模型">
+        <Sparkles size={14} />
+        <select
+          value={selectedModelId}
+          disabled={!models.length}
+          aria-label="选择大模型"
+          onChange={(event) => onModelChange(event.target.value)}
+        >
+          {models.length ? (
+            models.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.name}
+              </option>
+            ))
+          ) : (
+            <option value={selectedModelId}>{selectedModelId}</option>
+          )}
+        </select>
+        <a className="composerModelMore" href="/models" title="打开模型管理">更多</a>
+      </label>
     </div>
   );
 }

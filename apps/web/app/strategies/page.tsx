@@ -6,6 +6,7 @@ import { api, type StrategyAsset } from "../../lib/api";
 import { StrategyFlow } from "../../components/StrategyFlow";
 
 type ModalMode = "create" | "edit" | "merge";
+type BusyAction = "save" | "polish" | "delete" | null;
 
 const DEFAULT_MARKDOWN = "# 自定义分析策略\n\n## 分析步骤\n- 1_data_scope_and_quality_check\n- 2_metric_definition_and_field_mapping\n- 3_time_trend_decomposition\n- 4_dimension_group_comparison\n- 5_contribution_and_outlier_drilldown\n- 6_cross_dataset_consistency_check\n- 7_business_summary_and_risk_notes\n\n## 维度\nmonth, region\n\n## 指标\nrevenue, gross_margin";
 
@@ -18,6 +19,9 @@ export default function StrategiesPage() {
   const [markdown, setMarkdown] = useState(DEFAULT_MARKDOWN);
   const [mergeIds, setMergeIds] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<BusyAction>(null);
+  const [modalNotice, setModalNotice] = useState("");
+  const [polishDiff, setPolishDiff] = useState<Array<{ type: "added" | "changed"; text: string }>>([]);
 
   useEffect(() => {
     refresh();
@@ -34,6 +38,8 @@ export default function StrategiesPage() {
     setTitle("自定义分析策略");
     setMarkdown(DEFAULT_MARKDOWN);
     setMergeIds([]);
+    setModalNotice("");
+    setPolishDiff([]);
     setModalMode("create");
   }
 
@@ -42,6 +48,8 @@ export default function StrategiesPage() {
     setTitle("合并分析策略");
     setMarkdown("");
     setMergeIds(strategies.slice(0, 2).map((item) => item.id));
+    setModalNotice("");
+    setPolishDiff([]);
     setModalMode("merge");
   }
 
@@ -50,18 +58,34 @@ export default function StrategiesPage() {
     setTitle(strategy.title);
     setMarkdown(strategy.markdown || strategyToMarkdown(strategy));
     setMergeIds([]);
+    setModalNotice("");
+    setPolishDiff([]);
     setModalMode("edit");
   }
 
   async function remove(strategyId: string) {
-    await api.deleteStrategyAsset(strategyId);
-    setStrategies((items) => items.filter((item) => item.id !== strategyId));
-    setNotice("策略已删除");
+    setBusy(true);
+    setBusyAction("delete");
+    try {
+      await api.deleteStrategyAsset(strategyId);
+      setStrategies((items) => items.filter((item) => item.id !== strategyId));
+      setNotice("策略已删除");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "删除失败");
+    } finally {
+      setBusy(false);
+      setBusyAction(null);
+    }
   }
 
   async function saveStrategy() {
-    if (!title.trim() || (modalMode !== "merge" && !markdown.trim())) return;
+    if (!title.trim() || (modalMode !== "merge" && !markdown.trim())) {
+      setModalNotice("请先填写策略名称和 Markdown 内容");
+      return;
+    }
     setBusy(true);
+    setBusyAction("save");
+    setModalNotice(modalMode === "merge" ? "正在合并策略..." : "正在保存策略...");
     try {
       let saved: StrategyAsset;
       if (modalMode === "edit" && editingStrategy) {
@@ -73,44 +97,69 @@ export default function StrategiesPage() {
       }
       setStrategies((items) => [saved, ...items.filter((item) => item.id !== saved.id)]);
       setModalMode(null);
+      setModalNotice("");
+      setPolishDiff([]);
       setNotice(modalMode === "merge" ? "策略已合并创建" : modalMode === "edit" ? "策略已更新" : "策略已创建");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "保存失败");
+      const message = error instanceof Error ? error.message : "保存失败";
+      setModalNotice(message);
+      setNotice(message);
     } finally {
       setBusy(false);
+      setBusyAction(null);
     }
   }
 
   async function polish() {
-    if (!title.trim() || !markdown.trim()) return;
+    if (!title.trim() || !markdown.trim()) {
+      setModalNotice("请先填写策略名称和 Markdown 内容");
+      return;
+    }
     setBusy(true);
+    setBusyAction("polish");
+    setModalNotice("正在润色策略，并同步刷新右侧流程图...");
     try {
+      const before = markdown;
       const result = await api.polishStrategyAsset({ title: title.trim(), markdown });
       setTitle(result.title);
       setMarkdown(result.markdown);
+      setPolishDiff(buildPolishDiff(before, result.markdown));
+      setModalNotice("已完成润色。请检查 Markdown 与流程预览，确认后保存。");
       setNotice("策略已润色，可确认保存");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "润色失败");
+      const message = error instanceof Error ? error.message : "润色失败";
+      setModalNotice(message);
+      setNotice(message);
     } finally {
       setBusy(false);
+      setBusyAction(null);
     }
   }
 
   async function polishStrategy(strategy: StrategyAsset) {
+    setEditingStrategy(strategy);
+    setTitle(strategy.title);
+    setMarkdown(strategy.markdown || strategyToMarkdown(strategy));
+    setMergeIds([]);
+    setModalMode("edit");
     setBusy(true);
+    setBusyAction("polish");
+    setModalNotice("正在润色策略，并同步刷新右侧流程图...");
     try {
       const source = strategy.markdown || strategyToMarkdown(strategy);
       const result = await api.polishStrategyAsset({ title: strategy.title, markdown: source });
-      setEditingStrategy(strategy);
       setTitle(result.title);
       setMarkdown(result.markdown);
-      setMergeIds([]);
-      setModalMode("edit");
+      setPolishDiff(buildPolishDiff(source, result.markdown));
+      setModalNotice("已完成润色。请检查 Markdown 与流程预览，确认后保存。");
       setNotice("策略已润色，可确认保存");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "润色失败");
+      const message = error instanceof Error ? error.message : "润色失败";
+      setModalNotice(message);
+      setNotice(message);
     } finally {
       setBusy(false);
+      setBusyAction(null);
     }
   }
 
@@ -157,8 +206,8 @@ export default function StrategiesPage() {
               </div>
               <div className="strategyActions">
                 <button onClick={() => openEdit(strategy)}><Pencil size={15} /> 编辑</button>
-                <button onClick={() => polishStrategy(strategy)}><Sparkles size={15} /> 润色</button>
-                <button onClick={() => remove(strategy.id)}><Trash2 size={15} /> 删除</button>
+                <button disabled={busy} onClick={() => polishStrategy(strategy)}><Sparkles size={15} /> 润色</button>
+                <button disabled={busy} onClick={() => remove(strategy.id)}><Trash2 size={15} /> 删除</button>
               </div>
             </article>
           ))}
@@ -173,10 +222,24 @@ export default function StrategiesPage() {
                 <h2>{modalMode === "merge" ? "合并已有策略" : modalMode === "edit" ? "编辑策略" : "新增策略"}</h2>
                 <p>{modalMode === "merge" ? `已选择 ${selectedMergeStrategies.length} 个策略` : "支持 Markdown 编辑和润色"}</p>
               </div>
-              <button className="iconOnly" onClick={() => setModalMode(null)} title="关闭"><X size={16} /></button>
+              <button className="iconOnly" disabled={busy} onClick={() => setModalMode(null)} title="关闭"><X size={16} /></button>
             </div>
 
             <label className="formLabel">策略名称<input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
+            {modalNotice ? <div className={modalNotice.includes("失败") || modalNotice.includes("超时") || modalNotice.includes("请先") ? "modalNotice error" : "modalNotice"}>{modalNotice}</div> : null}
+            {polishDiff.length ? (
+              <section className="polishDiffPanel">
+                <h3>润色后变化</h3>
+                <div>
+                  {polishDiff.map((item, index) => (
+                    <p key={`${item.type}-${index}`} className={item.type === "added" ? "added" : "changed"}>
+                      <span>{item.type === "added" ? "新增" : "优化"}</span>
+                      {item.text}
+                    </p>
+                  ))}
+                </div>
+              </section>
+            ) : null}
 
             {modalMode === "merge" ? (
               <div className="pickerList">
@@ -205,9 +268,13 @@ export default function StrategiesPage() {
             )}
 
             <div className="buttonRow">
-              {modalMode !== "merge" ? <button disabled={busy} onClick={polish}><Sparkles size={15} /> 润色</button> : null}
+              {modalMode !== "merge" ? (
+                <button disabled={busy} onClick={polish}>
+                  <Sparkles size={15} /> {busyAction === "polish" ? "润色中..." : "润色"}
+                </button>
+              ) : null}
               <button className="confirmButton" disabled={busy || (modalMode === "merge" && !mergeIds.length)} onClick={saveStrategy}>
-                <Check size={15} /> 确认
+                <Check size={15} /> {busyAction === "save" ? "保存中..." : "确认"}
               </button>
             </div>
           </section>
@@ -243,4 +310,28 @@ function parseMethodsFromMarkdown(markdown: string) {
     }
   });
   return methods.slice(0, 12);
+}
+
+function buildPolishDiff(before: string, after: string) {
+  const beforeLines = normalizeMarkdownLines(before);
+  const afterLines = normalizeMarkdownLines(after);
+  const beforeSet = new Set(beforeLines);
+  const added = afterLines
+    .filter((line) => !beforeSet.has(line))
+    .filter((line) => !line.startsWith("# "))
+    .slice(0, 8)
+    .map((text) => ({ type: "added" as const, text }));
+
+  if (added.length) return added;
+  if (before.trim() !== after.trim()) {
+    return [{ type: "changed" as const, text: "已规范策略结构、章节顺序和输出要求，右侧流程图已按润色后的步骤重新渲染。" }];
+  }
+  return [{ type: "changed" as const, text: "当前策略已经较完整，本次润色主要保留原分析步骤并补齐可追溯输出规范。" }];
+}
+
+function normalizeMarkdownLines(markdown: string) {
+  return markdown
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
 }

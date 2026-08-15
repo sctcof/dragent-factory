@@ -24,7 +24,12 @@ class RedisCache:
         try:
             import redis
 
-            client = redis.Redis.from_url(self.redis_url, decode_responses=True, socket_connect_timeout=1.5)
+            client = redis.Redis.from_url(
+                self.redis_url,
+                decode_responses=True,
+                socket_connect_timeout=1.5,
+                socket_timeout=2.0,
+            )
             client.ping()
             self._client = client
             return self._client

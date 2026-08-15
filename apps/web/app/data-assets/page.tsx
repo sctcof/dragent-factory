@@ -1,12 +1,19 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import dynamic from "next/dynamic";
 import { ArrowLeft, BarChart3, CheckSquare, Database, FolderKanban, GitBranch, Pencil, Plus, Search, Server, Tags, Trash2, X } from "lucide-react";
 import { api, type Asset, type AssetTag, type CombinedKnowledgeGraph, type Dataset, type Datasource } from "../../lib/api";
 import { saveAnalysisPlan } from "../../lib/analysisPlan";
-import { GraphNetwork } from "../../components/GraphNetwork";
-import { RecommendedQuestionsPanel } from "../../components/RecommendedQuestionsPanel";
 import { TagMultiSelect } from "../../components/TagMultiSelect";
+
+const GraphNetwork = dynamic(() => import("../../components/GraphNetwork").then((m) => m.GraphNetwork), {
+  ssr: false,
+  loading: () => <div className="graphPlaceholder">知识图加载中…</div>,
+});
+const RecommendedQuestionsPanel = dynamic(() => import("../../components/RecommendedQuestionsPanel").then((m) => m.RecommendedQuestionsPanel), {
+  ssr: false,
+});
 
 type AssetView = "assets" | "connections" | "datasets" | "tags";
 type AssetGroupMode = "tag" | "kind";
@@ -64,7 +71,20 @@ function leafTagsOfAsset(asset: Asset): string[] {
 }
 
 function isTagUnderOrEqual(tagPathValue: string, filterPath: string): boolean {
-  return tagPathValue === filterPath || tagPathValue.startsWith(`${filterPath}/`);
+  if (tagPathValue === filterPath || tagPathValue.startsWith(`${filterPath}/`)) return true;
+  // 资产标签可能只保存了叶子名（如 "CSV"），而 managed tag 路径为 "数据源/CSV"，按叶子名再匹配一次
+  const filterLeaf = filterPath.split("/").pop() || filterPath;
+  const tagLeaf = tagPathValue.split("/").pop() || tagPathValue;
+  return tagLeaf === filterLeaf;
+}
+
+/** 判断某个 tag 字符串是否对应给定的 AssetTag（按完整路径或叶子名匹配）。 */
+function tagStringMatches(value: string, tag: AssetTag): boolean {
+  const path = tagPath(tag);
+  const name = tag.name;
+  const valuePath = value.trim();
+  const valueLeaf = valuePath.split("/").pop() || valuePath;
+  return valuePath === path || valuePath.startsWith(`${path}/`) || valueLeaf === name;
 }
 
 function toLeafTagValues(tags: string[]): string[] {
@@ -342,25 +362,33 @@ export default function DataAssetsPage() {
   }, []);
 
   async function refresh() {
-    const [library, ds, supportedData, tags, datasetList] = await Promise.all([
-      api.assetLibrary(),
-      api.datasources(),
-      api.supportedDatasources(),
-      api.listTags(),
-      api.listDatasets(),
-    ]);
-    setAssets(library.data_assets);
-    setDatasources(ds);
-    setManagedTags(tags);
-    setDatasets(datasetList);
-    if (!newTagParentId) setNewTagParentId("__root__");
-    setSupported(supportedData.supported);
-    if (supportedData.labels) setKindLabels({ ...DEFAULT_KIND_LABELS, ...supportedData.labels });
-    if (supportedData.kinds?.length) {
-      setKindOrder([
-        ...supportedData.kinds.filter((kind) => kind !== FILE_CONNECTION_KIND),
-        FILE_CONNECTION_KIND,
+    setNotice("加载中…");
+    try {
+      const [library, ds, supportedData, tags, datasetList] = await Promise.all([
+        api.listAssetSummaries(),
+        api.datasources(),
+        api.supportedDatasources(),
+        api.listTags(),
+        api.listDatasets(),
       ]);
+      setAssets(library || []);
+      setDatasources(ds || []);
+      setManagedTags(tags || []);
+      setDatasets(datasetList || []);
+      if (!newTagParentId) setNewTagParentId("__root__");
+      setSupported(supportedData.supported);
+      if (supportedData.labels) setKindLabels({ ...DEFAULT_KIND_LABELS, ...supportedData.labels });
+      if (supportedData.kinds?.length) {
+        setKindOrder([
+          ...supportedData.kinds.filter((kind) => kind !== FILE_CONNECTION_KIND),
+          FILE_CONNECTION_KIND,
+        ]);
+      }
+      setNotice(
+        `准备就绪 · 资产 ${(library || []).length} · 数据集 ${(datasetList || []).length} · 连接 ${(ds || []).length}`
+      );
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "数据加载失败，请点击刷新重试");
     }
   }
 
@@ -889,14 +917,50 @@ export default function DataAssetsPage() {
       setNotice("系统默认标签 public 不可删除");
       return;
     }
+
+    // 删除标签时要考虑全部资产，不能受当前搜索/连接类型筛选影响。
+    const related = assets.filter((asset) =>
+      assetTags(asset).some((value) => tagStringMatches(value, tag))
+    );
+
+    if (related.length > 0) {
+      const confirmed = window.confirm(
+        `标签「${tagLabel(tag)}」当前被 ${related.length} 个数据资产使用。\n\n删除标签会自动从这些资产上移除该标签，不会删除资产本身。\n\n是否继续？`
+      );
+      if (!confirmed) return;
+    }
+
     setBusy(true);
     try {
+      if (related.length > 0) {
+        for (const asset of related) {
+          const currentTags = assetTags(asset);
+          const nextTags = currentTags
+            .map((t) => t.trim())
+            .filter((t) => !tagStringMatches(t, tag));
+          if (nextTags.length === 0) nextTags.push(DEFAULT_ASSET_TAG);
+          if (nextTags.length !== currentTags.length) {
+            await api.updateAssetTags(asset.id, nextTags);
+          }
+        }
+      }
       await api.deleteTag(tag.id);
       if (newTagParentId === tag.id) setNewTagParentId("__root__");
       await refresh();
       setNotice(`标签「${tagLabel(tag)}」已删除`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "删除标签失败");
+      const message = error instanceof Error ? error.message : "删除标签失败";
+      // 后端返回的 detail 可能是 JSON 字符串，提取其中的可读文本。
+      let friendly = message;
+      try {
+        const parsed = JSON.parse(message);
+        if (parsed && typeof parsed.detail === "string") {
+          friendly = parsed.detail;
+        }
+      } catch {
+        // keep raw message
+      }
+      setNotice(friendly);
     } finally {
       setBusy(false);
     }
@@ -1031,11 +1095,13 @@ export default function DataAssetsPage() {
   const uniqueVisibleAssetIds = useMemo(() => Array.from(new Set(visibleAssetIds)), [visibleAssetIds]);
 
   function assetCountForTag(tag: AssetTag | string): number {
-    const path = typeof tag === "string" ? tag : tagPath(tag);
-    return filteredAssets.filter((asset) => {
-      if (activeKindFilter !== "all" && connectionKindOf(asset) !== activeKindFilter) return false;
-      return leafTagsOfAsset(asset).some((leaf) => isTagUnderOrEqual(leaf, path));
-    }).length;
+    const tagObj = typeof tag === "string"
+      ? ({ name: tag.split("/").pop() || tag, path: tag } as AssetTag)
+      : tag;
+    // 标签管理页统计应基于全部资产，不受当前搜索/连接类型筛选影响。
+    return assets.filter((asset) =>
+      assetTags(asset).some((value) => tagStringMatches(value, tagObj))
+    ).length;
   }
 
   function assetCountForKind(kind: string): number {

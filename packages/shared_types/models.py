@@ -40,9 +40,18 @@ class ChartType(str, Enum):
     metric = "metric"
     line = "line"
     bar = "bar"
+    area = "area"
     pie = "pie"
+    doughnut = "doughnut"
+    rose = "rose"
     heatmap = "heatmap"
     scatter = "scatter"
+    stacked_bar = "stacked_bar"
+    horizontal_bar = "horizontal_bar"
+    radar = "radar"
+    gauge = "gauge"
+    funnel = "funnel"
+    treemap = "treemap"
     table = "table"
     graph = "graph"
 
@@ -194,6 +203,7 @@ class Task(BaseModel):
     generated_code: Optional[str] = None
     execution_id: Optional[str] = None
     analysis_summary: Optional[str] = None
+    preferred_model: Optional[str] = None
     chart_ids: List[str] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
     created_at: str = Field(default_factory=now_iso)
@@ -312,6 +322,112 @@ class Dashboard(BaseModel):
     created_at: str = Field(default_factory=now_iso)
 
 
+class ModelCatalogEntry(BaseModel):
+    id: str
+    name: str
+    provider: str = "local"  # local | openai_compatible
+    enabled: bool = True
+    description: str = ""
+    # 模型级网关配置；优先于全局 ModelConfig / 环境变量
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+
+
+# 常用 OpenAI 兼容网关预设（模型 ID 即请求体中的 model 字段）
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENAI_BASE_URL_DEFAULT = "https://api.openai.com/v1"
+
+
+def default_model_catalog() -> List["ModelCatalogEntry"]:
+    return [
+        ModelCatalogEntry(
+            id="local-heuristic",
+            name="本地启发式",
+            provider="local",
+            description="无外部依赖，确定性规则分析",
+        ),
+        ModelCatalogEntry(
+            id="local-codegen",
+            name="本地代码生成",
+            provider="local",
+            description="确定性 Python 代码模板",
+        ),
+        ModelCatalogEntry(
+            id="local-writer",
+            name="本地报告写作",
+            provider="local",
+            description="本地报告拼装与导出",
+        ),
+        ModelCatalogEntry(
+            id="deepseek-chat",
+            name="DeepSeek Chat",
+            provider="openai_compatible",
+            enabled=True,
+            description="DeepSeek 官方 API；填写本模型 API Key 即可使用",
+            llm_base_url=DEEPSEEK_BASE_URL,
+        ),
+        ModelCatalogEntry(
+            id="deepseek-reasoner",
+            name="DeepSeek Reasoner",
+            provider="openai_compatible",
+            enabled=True,
+            description="DeepSeek 推理模型（R1）；填写本模型 API Key 即可使用",
+            llm_base_url=DEEPSEEK_BASE_URL,
+        ),
+        ModelCatalogEntry(
+            id="deepseek/deepseek-chat",
+            name="OpenRouter · DeepSeek Chat",
+            provider="openai_compatible",
+            enabled=True,
+            description="经 OpenRouter 调用 DeepSeek；填写 OpenRouter API Key",
+            llm_base_url=OPENROUTER_BASE_URL,
+        ),
+        ModelCatalogEntry(
+            id="openai/gpt-4o",
+            name="OpenRouter · GPT-4o",
+            provider="openai_compatible",
+            enabled=False,
+            description="经 OpenRouter 调用 GPT-4o；填写 OpenRouter API Key",
+            llm_base_url=OPENROUTER_BASE_URL,
+        ),
+        ModelCatalogEntry(
+            id="gpt-4o-mini",
+            name="GPT-4o mini",
+            provider="openai_compatible",
+            enabled=False,
+            description="OpenAI 官方兼容接口；可填官方或其它网关",
+            llm_base_url=OPENAI_BASE_URL_DEFAULT,
+        ),
+        ModelCatalogEntry(
+            id="gpt-4o",
+            name="GPT-4o",
+            provider="openai_compatible",
+            enabled=False,
+            description="OpenAI 官方兼容接口；可填官方或其它网关",
+            llm_base_url=OPENAI_BASE_URL_DEFAULT,
+        ),
+    ]
+
+
+def recommended_gateway_presets() -> List["ModelCatalogEntry"]:
+    """Seed entries merged into existing catalogs when IDs are missing."""
+    return [
+        item
+        for item in default_model_catalog()
+        if item.provider == "openai_compatible"
+        and item.id
+        in {
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek/deepseek-chat",
+            "openai/gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4o",
+        }
+    ]
+
+
 class ModelConfig(BaseModel):
     global_default: str = "local-heuristic"
     agents: Dict[str, str] = Field(
@@ -324,6 +440,10 @@ class ModelConfig(BaseModel):
         }
     )
     params: Dict[str, Any] = Field(default_factory=lambda: {"temperature": 0.2})
+    catalog: List[ModelCatalogEntry] = Field(default_factory=default_model_catalog)
+    # OpenAI 兼容网关；优先于进程环境变量 LLM_BASE_URL / LLM_API_KEY
+    llm_base_url: str = ""
+    llm_api_key: str = ""
 
 
 class AuditLog(BaseModel):

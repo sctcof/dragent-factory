@@ -16,7 +16,13 @@ class PostgresRepository:
     """Document-style repository backed by PostgreSQL, mirroring JsonRepository APIs."""
 
     def __init__(self, database_url: str = DATABASE_URL) -> None:
-        self.engine: Engine = create_engine(database_url, pool_pre_ping=True)
+        # connect_timeout 避免 Postgres 不可达时请求无限挂起（表现为前端保存弹窗不关闭）
+        self.engine: Engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_timeout=10,
+            connect_args={"connect_timeout": 5},
+        )
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:

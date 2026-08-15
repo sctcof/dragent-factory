@@ -136,6 +136,8 @@ export default function HomePage() {
           <a href="#architecture">架构</a>
           <a href="#connections">数据连接</a>
           <a href="#cases">案例</a>
+          <a href="/help">接口文档</a>
+          <a href="/system">系统配置</a>
           <a className="homeNavCta" href="/workspace">进入工作台</a>
         </nav>
       </header>
