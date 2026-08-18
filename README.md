@@ -2,6 +2,8 @@
 
 基于 `dragent.md` 与 `docs/engineering-architecture.md` 落地的可运行工程实现。系统按六层架构拆分为 Web 工作台、FastAPI 应用服务、多 Agent 编排、模型网关、本地 RAG/图谱适配、数据接入、执行沙箱、报告与看板模块。
 
+![Data-RAG-Agent 首页预览](docs/images/homepage-preview.png)
+
 支持两种本地落地方式：
 
 | 模式 | 适用场景 | 依赖 |
